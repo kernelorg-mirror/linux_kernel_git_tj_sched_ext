@@ -2040,7 +2040,7 @@ static bool move_task_to_local_dsq(struct rq *rq, struct task_struct *p,
 /**
  * dispatch_to_local_dsq_lock - Ensure source and destination rq's are locked
  * @rq: current rq which is locked
- * @rf: rq_flags to use when unlocking @rq
+ * @rf: optional rq_flags to use when unlocking @rq if its lock is pinned
  * @src_rq: rq to move task from
  * @dst_rq: rq to move task to
  *
@@ -2052,17 +2052,20 @@ static bool move_task_to_local_dsq(struct rq *rq, struct task_struct *p,
 static void dispatch_to_local_dsq_lock(struct rq *rq, struct rq_flags *rf,
 				       struct rq *src_rq, struct rq *dst_rq)
 {
-	rq_unpin_lock(rq, rf);
+	if (rf)
+		rq_unpin_lock(rq, rf);
 
 	if (src_rq == dst_rq) {
 		raw_spin_rq_unlock(rq);
 		raw_spin_rq_lock(dst_rq);
 	} else if (rq == src_rq) {
 		double_lock_balance(rq, dst_rq);
-		rq_repin_lock(rq, rf);
+		if (rf)
+			rq_repin_lock(rq, rf);
 	} else if (rq == dst_rq) {
 		double_lock_balance(rq, src_rq);
-		rq_repin_lock(rq, rf);
+		if (rf)
+			rq_repin_lock(rq, rf);
 	} else {
 		raw_spin_rq_unlock(rq);
 		double_rq_lock(src_rq, dst_rq);
@@ -2072,7 +2075,7 @@ static void dispatch_to_local_dsq_lock(struct rq *rq, struct rq_flags *rf,
 /**
  * dispatch_to_local_dsq_unlock - Undo dispatch_to_local_dsq_lock()
  * @rq: current rq which is locked
- * @rf: rq_flags to use when unlocking @rq
+ * @rf: optional rq_flags to use when unlocking @rq if its lock is pinned
  * @src_rq: rq to move task from
  * @dst_rq: rq to move task to
  *
@@ -2084,7 +2087,8 @@ static void dispatch_to_local_dsq_unlock(struct rq *rq, struct rq_flags *rf,
 	if (src_rq == dst_rq) {
 		raw_spin_rq_unlock(dst_rq);
 		raw_spin_rq_lock(rq);
-		rq_repin_lock(rq, rf);
+		if (rf)
+			rq_repin_lock(rq, rf);
 	} else if (rq == src_rq) {
 		double_unlock_balance(rq, dst_rq);
 	} else if (rq == dst_rq) {
@@ -2092,7 +2096,8 @@ static void dispatch_to_local_dsq_unlock(struct rq *rq, struct rq_flags *rf,
 	} else {
 		double_rq_unlock(src_rq, dst_rq);
 		raw_spin_rq_lock(rq);
-		rq_repin_lock(rq, rf);
+		if (rf)
+			rq_repin_lock(rq, rf);
 	}
 }
 #endif	/* CONFIG_SMP */
@@ -2214,7 +2219,7 @@ enum dispatch_to_local_dsq_ret {
 /**
  * dispatch_to_local_dsq - Dispatch a task to a local dsq
  * @rq: current rq which is locked
- * @rf: rq_flags to use when unlocking @rq
+ * @rf: optional rq_flags to use when unlocking @rq if its lock is pinned
  * @dsq_id: destination dsq ID
  * @p: task to dispatch
  * @enq_flags: %SCX_ENQ_*
