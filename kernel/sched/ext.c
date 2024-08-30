@@ -1453,13 +1453,20 @@ static void schedule_deferred(struct rq *rq)
  */
 static void touch_core_sched(struct rq *rq, struct task_struct *p)
 {
+	lockdep_assert_rq_held(rq);
+
 #ifdef CONFIG_SCHED_CORE
 	/*
 	 * It's okay to update the timestamp spuriously. Use
 	 * sched_core_disabled() which is cheaper than enabled().
+	 *
+	 * TODO: ktime_get_ns() is used because rq_clock_task() can't be used as
+	 * SCX balance path doesn't pin the rq. As this is used to determine
+	 * ordering between tasks of sibling CPUs, it'd be better to use
+	 * per-core dispatch sequence instead.
 	 */
 	if (!sched_core_disabled())
-		p->scx.core_sched_at = rq_clock_task(rq);
+		p->scx.core_sched_at = ktime_get_ns();
 #endif
 }
 
@@ -1476,7 +1483,6 @@ static void touch_core_sched(struct rq *rq, struct task_struct *p)
 static void touch_core_sched_dispatch(struct rq *rq, struct task_struct *p)
 {
 	lockdep_assert_rq_held(rq);
-	assert_clock_updated(rq);
 
 #ifdef CONFIG_SCHED_CORE
 	if (SCX_HAS_OP(core_sched_before))
