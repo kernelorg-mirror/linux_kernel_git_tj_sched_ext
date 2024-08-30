@@ -44,7 +44,7 @@ void io_sq_thread_unpark(struct io_sq_data *sqd)
 void io_sq_thread_park(struct io_sq_data *sqd)
 	__acquires(&sqd->lock)
 {
-	WARN_ON_ONCE(sqd->thread == current);
+	WARN_ON_ONCE(data_race(sqd->thread) == current);
 
 	atomic_inc(&sqd->park_pending);
 	set_bit(IO_SQ_THREAD_SHOULD_PARK, &sqd->state);
@@ -108,14 +108,14 @@ static struct io_sq_data *io_attach_sq_data(struct io_uring_params *p)
 	struct fd f;
 
 	f = fdget(p->wq_fd);
-	if (!f.file)
+	if (!fd_file(f))
 		return ERR_PTR(-ENXIO);
-	if (!io_is_uring_fops(f.file)) {
+	if (!io_is_uring_fops(fd_file(f))) {
 		fdput(f);
 		return ERR_PTR(-EINVAL);
 	}
 
-	ctx_attach = f.file->private_data;
+	ctx_attach = fd_file(f)->private_data;
 	sqd = ctx_attach->sq_data;
 	if (!sqd) {
 		fdput(f);
@@ -418,9 +418,9 @@ __cold int io_sq_offload_create(struct io_ring_ctx *ctx,
 		struct fd f;
 
 		f = fdget(p->wq_fd);
-		if (!f.file)
+		if (!fd_file(f))
 			return -ENXIO;
-		if (!io_is_uring_fops(f.file)) {
+		if (!io_is_uring_fops(fd_file(f))) {
 			fdput(f);
 			return -EINVAL;
 		}
