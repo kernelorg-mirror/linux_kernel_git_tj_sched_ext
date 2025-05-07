@@ -828,6 +828,11 @@ void BPF_STRUCT_OPS(qmap_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+s32 BPF_STRUCT_OPS(qmap_sub_attach, struct scx_sched *sub_sch)
+{
+	return 0;
+}
+
 SCX_OPS_DEFINE(qmap_ops,
 	       .select_cpu		= (void *)qmap_select_cpu,
 	       .enqueue			= (void *)qmap_enqueue,
@@ -845,4 +850,5 @@ SCX_OPS_DEFINE(qmap_ops,
 	       .init			= (void *)qmap_init,
 	       .exit			= (void *)qmap_exit,
 	       .timeout_ms		= 5000U,
-	       .name			= "qmap");
+	       .name			= "qmap",
+	       .sub_attach		= (void *)qmap_sub_attach);
