@@ -907,6 +907,12 @@ struct scx_event_stats {
 	 * scheduler.
 	 */
 	s64		SCX_EV_INSERT_NOT_OWNED;
+
+	/*
+	 * The number of times tasks from bypassing descendants are scheduled
+	 * from sub_bypass_dsq's.
+	 */
+	s64		SCX_EV_SUB_BYPASS_DISPATCH;
 };
 
 enum scx_sched_pcpu_flags {
@@ -943,6 +949,9 @@ struct scx_sched_pcpu {
 
 struct scx_sched_pnode {
 	struct scx_dispatch_q	global_dsq;
+#ifdef CONFIG_EXT_SUB_SCHED
+	struct scx_dispatch_q	sub_bypass_dsq;
+#endif	/* CONFIG_EXT_SUB_SCHED */
 };
 
 struct scx_sched {

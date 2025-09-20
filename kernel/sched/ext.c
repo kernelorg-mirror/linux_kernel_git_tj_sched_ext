@@ -282,6 +282,42 @@ static struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch, u64 dsq_id)
 	return rhashtable_lookup(&sch->dsq_hash, &dsq_id, dsq_hash_params);
 }
 
+static struct scx_dispatch_q *find_bypass_dsq(struct scx_sched *sch,
+					      struct rq *rq,
+					      struct task_struct *p)
+{
+#ifdef CONFIG_EXT_SUB_SCHED
+	struct scx_sched *pos;
+
+	/*
+	 * If @sch is a sub-sched which is bypassing, its tasks should go into
+	 * the bypass_dsq of the nearest ancestor which is not bypassing. The
+	 * not-bypassing sched is responsible for scheduling all tasks from
+	 * bypassing sub-trees. If all ancestors including root are bypassing,
+	 * there is no one home and @p should go to the root's global_dsq.
+	 *
+	 * Whenever a sched starts bypassing, all runnable tasks in its subtree
+	 * are re-enqueued after scx_bypassing() is turned on, guaranteeing that
+	 * all tasks are transferred to the right DSQ.
+	 */
+	pos = scx_parent(sch);
+	if (pos) {
+		while (true) {
+			if (!scx_bypassing(pos, cpu_of(rq))) {
+				int node = cpu_to_node(task_cpu(p));
+				return &pos->pnode[node]->sub_bypass_dsq;
+			}
+			if (pos->level == 0) {
+				sch = pos;
+				break;
+			}
+			pos = scx_parent(pos);
+		}
+	}
+#endif
+	return find_global_dsq(sch, p);
+}
+
 /*
  * scx_kf_mask enforcement. Some kfuncs can only be called from specific SCX
  * ops. When invoking SCX ops, SCX_CALL_OP[_RET]() should be used to indicate
@@ -1353,6 +1389,7 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 			    int sticky_cpu)
 {
 	struct scx_sched *sch = scx_task_sched(p);
+	struct scx_dispatch_q *fallback_dsq;
 	struct task_struct **ddsp_taskp;
 	unsigned long qseq;
 
@@ -1372,7 +1409,8 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 
 	if (scx_bypassing(sch, cpu_of(rq))) {
 		__scx_add_event(sch, SCX_EV_BYPASS_DISPATCH, 1);
-		goto global;
+		fallback_dsq = find_bypass_dsq(sch, rq, p);
+		goto fallback;
 	}
 
 	if (p->scx.ddsp_dsq_id != SCX_DSQ_INVALID)
@@ -1392,8 +1430,10 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 		goto local;
 	}
 
-	if (unlikely(!SCX_HAS_OP(sch, enqueue)))
-		goto global;
+	if (unlikely(!SCX_HAS_OP(sch, enqueue))) {
+		fallback_dsq = find_global_dsq(sch, p);
+		goto fallback;
+	}
 
 	/* DSQ bypass didn't trigger, enqueue on the BPF scheduler */
 	qseq = rq->scx.ops_qseq++ << SCX_OPSS_QSEQ_SHIFT;
@@ -1434,10 +1474,10 @@ local_norefill:
 	dispatch_enqueue(sch, &rq->scx.local_dsq, p, enq_flags);
 	return;
 
-global:
+fallback:
 	touch_core_sched(rq, p);	/* see the comment in local: */
 	refill_task_slice_dfl(sch, p);
-	dispatch_enqueue(sch, find_global_dsq(sch, p), p, enq_flags);
+	dispatch_enqueue(sch, fallback_dsq, p, enq_flags);
 }
 
 static bool task_runnable(const struct task_struct *p)
@@ -1961,11 +2001,36 @@ retry:
 	return false;
 }
 
-static bool consume_global_dsq(struct scx_sched *sch, struct rq *rq)
+static bool consume_fallback_dsqs(struct scx_sched *sch, struct rq *rq)
 {
-	int node = cpu_to_node(cpu_of(rq));
+	struct scx_sched_pnode *pnode = sch->pnode[cpu_to_node(cpu_of(rq))];
 
-	return consume_dispatch_q(sch, rq, &sch->pnode[node]->global_dsq);
+	if (consume_dispatch_q(sch, rq, &pnode->global_dsq))
+		return true;
+
+#ifdef CONFIG_EXT_SUB_SCHED
+	/*
+	 * @sch must ensure forward progress of its bypassing descendants that
+	 * dump their tasks into @sch's bypass DSQs. The following implements a
+	 * simple built-in behavior - let each CPU toggle between regular
+	 * dispatch and the bypass DSQ.
+	 *
+	 * Later, if necessary, we can add an ops flag to suppress the
+	 * auto-consumption and a kfunc to consume the bypass DSQ and, so that
+	 * the BPF scheduler can fully control scheduling of bypassed tasks.
+	 */
+	if (rq->scx.dsp_sub_bypass_toggle) {
+		if (consume_dispatch_q(sch, rq, &pnode->sub_bypass_dsq)) {
+			__scx_add_event(sch, SCX_EV_SUB_BYPASS_DISPATCH, 1);
+			rq->scx.dsp_sub_bypass_toggle = false;
+			return true;
+		}
+	} else {
+		rq->scx.dsp_sub_bypass_toggle = true;
+	}
+#endif	/* CONFIG_EXT_SUB_SCHED */
+
+	return false;
 }
 
 /**
@@ -2175,7 +2240,7 @@ static bool scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
 	bool prev_on_sch = (prev->sched_class == &ext_sched_class) &&
 		sch == rcu_access_pointer(prev->scx.sched);
 
-	if (consume_global_dsq(sch, rq))
+	if (consume_fallback_dsqs(sch, rq))
 		return true;
 
 	if (unlikely(!SCX_HAS_OP(sch, dispatch)) ||
@@ -2205,7 +2270,7 @@ static bool scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
 		}
 		if (rq->scx.local_dsq.nr)
 			return true;
-		if (consume_global_dsq(sch, rq))
+		if (consume_fallback_dsqs(sch, rq))
 			return true;
 
 		/*
@@ -3789,6 +3854,7 @@ static ssize_t scx_attr_events_show(struct kobject *kobj,
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_DISPATCH);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_ACTIVATE);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_INSERT_NOT_OWNED);
+	at += scx_attr_event_show(buf, at, &events, SCX_EV_SUB_BYPASS_DISPATCH);
 	return at;
 }
 SCX_ATTR(events);
@@ -4870,6 +4936,7 @@ static void scx_dump_state(struct scx_sched *sch, struct scx_exit_info *ei,
 	scx_dump_event(s, &events, SCX_EV_BYPASS_DISPATCH);
 	scx_dump_event(s, &events, SCX_EV_BYPASS_ACTIVATE);
 	scx_dump_event(s, &events, SCX_EV_INSERT_NOT_OWNED);
+	scx_dump_event(s, &events, SCX_EV_SUB_BYPASS_DISPATCH);
 
 	if (seq_buf_has_overflowed(&s) && dump_len >= sizeof(trunc_marker))
 		memcpy(ei->dump + dump_len - sizeof(trunc_marker),
@@ -4951,6 +5018,9 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 		}
 
 		init_dsq(&pnode->global_dsq, SCX_DSQ_GLOBAL, sch);
+#ifdef CONFIG_EXT_SUB_SCHED
+		init_dsq(&pnode->sub_bypass_dsq, SCX_DSQ_SUB_BYPASS, sch);
+#endif	/* CONFIG_EXT_SUB_SCHED */
 		sch->pnode[node] = pnode;
 	}
 
@@ -7623,6 +7693,7 @@ static void scx_read_events(struct scx_sched *sch, struct scx_event_stats *event
 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_DISPATCH);
 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_ACTIVATE);
 		scx_agg_event(events, e_cpu, SCX_EV_INSERT_NOT_OWNED);
+		scx_agg_event(events, e_cpu, SCX_EV_SUB_BYPASS_DISPATCH);
 	}
 }
 

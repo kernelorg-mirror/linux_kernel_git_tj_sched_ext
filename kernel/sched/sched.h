@@ -780,6 +780,9 @@ struct scx_rq {
 	struct balance_callback	deferred_bal_cb;
 	struct irq_work		deferred_irq_work;
 	struct irq_work		kick_cpus_irq_work;
+#ifdef CONFIG_EXT_SUB_SCHED
+	bool			dsp_sub_bypass_toggle;
+#endif	/* CONFIG_EXT_SUB_SCHED */
 };
 #endif /* CONFIG_SCHED_CLASS_EXT */
 
