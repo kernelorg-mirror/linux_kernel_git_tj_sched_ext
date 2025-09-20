@@ -3949,6 +3949,7 @@ static void scx_bypass(struct scx_sched *sch, bool bypass)
 {
 	static DEFINE_RAW_SPINLOCK(bypass_lock);
 	static unsigned long bypass_timestamp;
+	struct scx_sched *pos;
 	unsigned long flags;
 	int cpu;
 
@@ -3970,6 +3971,24 @@ static void scx_bypass(struct scx_sched *sch, bool bypass)
 			      ktime_get_ns() - bypass_timestamp);
 	}
 
+	/*
+	 * Bypass state is propagated to all descendants - an scx_sched bypasses
+	 * if itself or any of its ancestors are in bypass mode.
+	 */
+	raw_spin_lock(&scx_sched_lock);
+	scx_for_each_descendant_pre(pos, sch) {
+		if (pos == sch)
+			continue;
+		if (bypass) {
+			pos->bypass_depth++;
+			WARN_ON_ONCE(pos->bypass_depth <= 0);
+		} else {
+			pos->bypass_depth--;
+			WARN_ON_ONCE(pos->bypass_depth < 0);
+		}
+	}
+	raw_spin_unlock(&scx_sched_lock);
+
 	if (!scx_parent(sch))
 		atomic_inc(&scx_breather_depth);
 
@@ -3984,18 +4003,20 @@ static void scx_bypass(struct scx_sched *sch, bool bypass)
 	 */
 	for_each_possible_cpu(cpu) {
 		struct rq *rq = cpu_rq(cpu);
-		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
 		struct task_struct *p, *n;
 
 		raw_spin_rq_lock(rq);
 
-		if (bypass) {
-			WARN_ON_ONCE(pcpu->flags & SCX_SCHED_PCPU_BYPASSING);
-			pcpu->flags |= SCX_SCHED_PCPU_BYPASSING;
-		} else {
-			WARN_ON_ONCE(!(pcpu->flags & SCX_SCHED_PCPU_BYPASSING));
-			pcpu->flags &= ~SCX_SCHED_PCPU_BYPASSING;
+		raw_spin_lock(&scx_sched_lock);
+		scx_for_each_descendant_pre(pos, sch) {
+			struct scx_sched_pcpu *pcpu = per_cpu_ptr(pos->pcpu, cpu);
+
+			if (pos->bypass_depth)
+				pcpu->flags |= SCX_SCHED_PCPU_BYPASSING;
+			else
+				pcpu->flags &= ~SCX_SCHED_PCPU_BYPASSING;
 		}
+		raw_spin_unlock(&scx_sched_lock);
 
 		/*
 		 * We need to guarantee that no tasks are on the BPF scheduler
@@ -4017,6 +4038,9 @@ static void scx_bypass(struct scx_sched *sch, bool bypass)
 		list_for_each_entry_safe_reverse(p, n, &rq->scx.runnable_list,
 						 scx.runnable_node) {
 			struct sched_enq_and_set_ctx ctx;
+
+			if (!scx_is_descendant(scx_task_sched(p), sch))
+				continue;
 
 			/* cycling deq/enq is enough, see the function comment */
 			sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE, &ctx);
