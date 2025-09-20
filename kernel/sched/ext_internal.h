@@ -1109,6 +1109,7 @@ enum scx_ops_state {
 #define SCX_OPSS_STATE_MASK	((1LU << SCX_OPSS_QSEQ_SHIFT) - 1)
 #define SCX_OPSS_QSEQ_MASK	(~SCX_OPSS_STATE_MASK)
 
+extern struct scx_sched __rcu *scx_root;
 DECLARE_PER_CPU(struct rq *, scx_locked_rq_state);
 
 /*
@@ -1129,3 +1130,44 @@ static inline bool scx_rq_bypassing(struct rq *rq)
 {
 	return unlikely(rq->scx.flags & SCX_RQ_BYPASSING);
 }
+
+#ifdef CONFIG_EXT_SUB_SCHED
+/**
+ * scx_task_sched - Find scx_sched scheduling a task
+ * @p: task of interest
+ *
+ * Return @p's scheduler instance. Must be called with @p's rq locked.
+ */
+static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
+{
+	return rcu_dereference_protected(p->scx.sched,
+					 lockdep_is_held(&p->pi_lock) ||
+					 lockdep_is_held(__rq_lockp(task_rq(p))));
+}
+
+/**
+ * scx_task_sched_rcu - Find scx_sched scheduling a task
+ * @p: task of interest
+ *
+ * Return @p's scheduler instance. The returned scx_sched is RCU protected.
+ */
+static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
+{
+	return rcu_dereference_check(p->scx.sched,
+				     rcu_read_lock_bh_held() ||
+				     rcu_read_lock_sched_held());
+}
+#else	/* CONFIG_EXT_SUB_SCHED */
+static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
+{
+	return rcu_dereference_protected(scx_root,
+					 lockdep_is_held(__rq_lockp(task_rq(p))));
+}
+
+static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
+{
+	return rcu_dereference_check(scx_root,
+				     rcu_read_lock_bh_held() ||
+				     rcu_read_lock_sched_held());
+}
+#endif	/* CONFIG_EXT_SUB_SCHED */
