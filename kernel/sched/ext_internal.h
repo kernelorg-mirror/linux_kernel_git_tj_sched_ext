@@ -909,7 +909,13 @@ struct scx_event_stats {
 	s64		SCX_EV_INSERT_NOT_OWNED;
 };
 
+enum scx_sched_pcpu_flags {
+	SCX_SCHED_PCPU_BYPASSING	= 1LLU << 0,
+};
+
 struct scx_sched_pcpu {
+	u64			flags;	/* protected by rq lock */
+
 	/*
 	 * The event counters are in a per-CPU variable to minimize the
 	 * accounting overhead. A system-wide view on the event counter is
@@ -934,6 +940,7 @@ struct scx_sched {
 	struct scx_dispatch_q	**global_dsqs;
 	struct scx_sched_pcpu __percpu *pcpu;
 
+	s32			bypass_depth;
 	s32			level;
 	bool			warned_zero_slice:1;
 	bool			warned_deprecated_rq:1;
@@ -1138,9 +1145,10 @@ static inline bool scx_kf_allowed_if_unlocked(void)
 	return !current->scx.kf_mask;
 }
 
-static inline bool scx_rq_bypassing(struct rq *rq)
+static inline bool scx_bypassing(struct scx_sched *sch, s32 cpu)
 {
-	return unlikely(rq->scx.flags & SCX_RQ_BYPASSING);
+	return unlikely(per_cpu_ptr(sch->pcpu, cpu)->flags &
+			SCX_SCHED_PCPU_BYPASSING);
 }
 
 #ifdef CONFIG_EXT_SUB_SCHED
