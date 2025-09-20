@@ -65,6 +65,7 @@ struct scx_dispatch_q {
 	u64			id;
 	struct rhash_head	hash_node;
 	struct llist_node	free_node;
+	struct scx_sched	*sched;
 	struct rcu_head		rcu;
 };
 
@@ -135,6 +136,8 @@ struct scx_dsq_list_node {
 	u32			flags;
 	u32			priv;		/* can be used by iter cursor */
 };
+
+struct scx_sched;
 
 /*
  * The following is embedded in task_struct and contains all fields necessary
