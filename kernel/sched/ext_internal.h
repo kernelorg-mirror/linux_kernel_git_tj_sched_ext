@@ -1157,6 +1157,32 @@ static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
 				     rcu_read_lock_bh_held() ||
 				     rcu_read_lock_sched_held());
 }
+
+/**
+ * scx_prog_sched - Find scx_sched associated with a BPF prog
+ * @aux: aux__prog passed in from BPF to a kfunc
+ *
+ * To be called from kfuncs. Return the scheduler instance associated with the
+ * BPF program given the special kfunc argument aux__prog. The returned
+ * scx_sched is RCU protected.
+ */
+static struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
+{
+	struct scx_sched *sch;
+
+	sch = rcu_dereference_check(aux->priv,
+				    rcu_read_lock_bh_held() ||
+				    rcu_read_lock_sched_held());
+	if (unlikely(IS_ERR(sch)))
+		return NULL;
+
+	if (sch)
+		return sch;
+
+	return rcu_dereference_check(scx_root,
+				     rcu_read_lock_bh_held() ||
+				     rcu_read_lock_sched_held());
+}
 #else	/* CONFIG_EXT_SUB_SCHED */
 static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
 {
@@ -1165,6 +1191,13 @@ static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
 }
 
 static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
+{
+	return rcu_dereference_check(scx_root,
+				     rcu_read_lock_bh_held() ||
+				     rcu_read_lock_sched_held());
+}
+
+static struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
 {
 	return rcu_dereference_check(scx_root,
 				     rcu_read_lock_bh_held() ||

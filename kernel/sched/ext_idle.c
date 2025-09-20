@@ -920,14 +920,15 @@ static s32 select_cpu_from_kfunc(struct scx_sched *sch, struct task_struct *p,
  * scx_bpf_cpu_node - Return the NUMA node the given @cpu belongs to, or
  *		      trigger an error if @cpu is invalid
  * @cpu: target CPU
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  */
-__bpf_kfunc int scx_bpf_cpu_node(s32 cpu)
+__bpf_kfunc int scx_bpf_cpu_node(s32 cpu, const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch) || !ops_cpu_valid(sch, cpu, NULL))
 		return NUMA_NO_NODE;
 	return cpu_to_node(cpu);
@@ -939,6 +940,7 @@ __bpf_kfunc int scx_bpf_cpu_node(s32 cpu)
  * @prev_cpu: CPU @p was on previously
  * @wake_flags: %SCX_WAKE_* flags
  * @is_idle: out parameter indicating whether the returned CPU is idle
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Can be called from ops.select_cpu(), ops.enqueue(), or from an unlocked
  * context such as a BPF test_run() call, as long as built-in CPU selection
@@ -949,14 +951,15 @@ __bpf_kfunc int scx_bpf_cpu_node(s32 cpu)
  * currently idle and thus a good candidate for direct dispatching.
  */
 __bpf_kfunc s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
-				       u64 wake_flags, bool *is_idle)
+				       u64 wake_flags, bool *is_idle,
+				       const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 	s32 cpu;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return -ENODEV;
 
@@ -996,7 +999,12 @@ __bpf_kfunc s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	/*
+	 * FIXME - This should be scx_prog_sched(). However, due to BPF
+	 * funcation all parameter count limit, we can't add @aux__prog to this
+	 * function. This can be fixed by packing the parameters into a struct.
+	 */
+	sch = scx_task_sched(p);
 	if (unlikely(!sch))
 		return -ENODEV;
 
@@ -1008,18 +1016,20 @@ __bpf_kfunc s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 
  * scx_bpf_get_idle_cpumask_node - Get a referenced kptr to the
  * idle-tracking per-CPU cpumask of a target NUMA node.
  * @node: target NUMA node
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Returns an empty cpumask if idle tracking is not enabled, if @node is
  * not valid, or running on a UP kernel. In this case the actual error will
  * be reported to the BPF scheduler via scx_error().
  */
-__bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask_node(int node)
+__bpf_kfunc const struct cpumask *
+scx_bpf_get_idle_cpumask_node(int node, const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return cpu_none_mask;
 
@@ -1033,17 +1043,19 @@ __bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask_node(int node)
 /**
  * scx_bpf_get_idle_cpumask - Get a referenced kptr to the idle-tracking
  * per-CPU cpumask.
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Returns an empty mask if idle tracking is not enabled, or running on a
  * UP kernel.
  */
-__bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask(void)
+__bpf_kfunc const struct cpumask *
+scx_bpf_get_idle_cpumask(const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return cpu_none_mask;
 
@@ -1063,18 +1075,20 @@ __bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask(void)
  * idle-tracking, per-physical-core cpumask of a target NUMA node. Can be
  * used to determine if an entire physical core is free.
  * @node: target NUMA node
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Returns an empty cpumask if idle tracking is not enabled, if @node is
  * not valid, or running on a UP kernel. In this case the actual error will
  * be reported to the BPF scheduler via scx_error().
  */
-__bpf_kfunc const struct cpumask *scx_bpf_get_idle_smtmask_node(int node)
+__bpf_kfunc const struct cpumask *
+scx_bpf_get_idle_smtmask_node(int node, const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return cpu_none_mask;
 
@@ -1092,17 +1106,19 @@ __bpf_kfunc const struct cpumask *scx_bpf_get_idle_smtmask_node(int node)
  * scx_bpf_get_idle_smtmask - Get a referenced kptr to the idle-tracking,
  * per-physical-core cpumask. Can be used to determine if an entire physical
  * core is free.
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Returns an empty mask if idle tracking is not enabled, or running on a
  * UP kernel.
  */
-__bpf_kfunc const struct cpumask *scx_bpf_get_idle_smtmask(void)
+__bpf_kfunc const struct cpumask *
+scx_bpf_get_idle_smtmask(const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return cpu_none_mask;
 
@@ -1138,6 +1154,7 @@ __bpf_kfunc void scx_bpf_put_idle_cpumask(const struct cpumask *idle_mask)
 /**
  * scx_bpf_test_and_clear_cpu_idle - Test and clear @cpu's idle state
  * @cpu: cpu to test and clear idle for
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Returns %true if @cpu was idle and its idle state was successfully cleared.
  * %false otherwise.
@@ -1145,13 +1162,14 @@ __bpf_kfunc void scx_bpf_put_idle_cpumask(const struct cpumask *idle_mask)
  * Unavailable if ops.update_idle() is implemented and
  * %SCX_OPS_KEEP_BUILTIN_IDLE is not set.
  */
-__bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu)
+__bpf_kfunc bool
+scx_bpf_test_and_clear_cpu_idle(s32 cpu, const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return false;
 
@@ -1169,6 +1187,7 @@ __bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu)
  * @cpus_allowed: Allowed cpumask
  * @node: target NUMA node
  * @flags: %SCX_PICK_IDLE_* flags
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Pick and claim an idle cpu in @cpus_allowed from the NUMA node @node.
  *
@@ -1184,13 +1203,14 @@ __bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu)
  * %SCX_OPS_BUILTIN_IDLE_PER_NODE is not set.
  */
 __bpf_kfunc s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
-					   int node, u64 flags)
+					   int node, u64 flags,
+					   const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return -ENODEV;
 
@@ -1205,6 +1225,7 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
  * scx_bpf_pick_idle_cpu - Pick and claim an idle cpu
  * @cpus_allowed: Allowed cpumask
  * @flags: %SCX_PICK_IDLE_CPU_* flags
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Pick and claim an idle cpu in @cpus_allowed. Returns the picked idle cpu
  * number on success. -%EBUSY if no matching cpu was found.
@@ -1224,13 +1245,14 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
  * scx_bpf_pick_idle_cpu_node() instead.
  */
 __bpf_kfunc s32 scx_bpf_pick_idle_cpu(const struct cpumask *cpus_allowed,
-				      u64 flags)
+				      u64 flags,
+				      const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return -ENODEV;
 
@@ -1251,6 +1273,7 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu(const struct cpumask *cpus_allowed,
  * @cpus_allowed: Allowed cpumask
  * @node: target NUMA node
  * @flags: %SCX_PICK_IDLE_CPU_* flags
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Pick and claim an idle cpu in @cpus_allowed. If none is available, pick any
  * CPU in @cpus_allowed. Guaranteed to succeed and returns the picked idle cpu
@@ -1267,14 +1290,15 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu(const struct cpumask *cpus_allowed,
  * CPU.
  */
 __bpf_kfunc s32 scx_bpf_pick_any_cpu_node(const struct cpumask *cpus_allowed,
-					  int node, u64 flags)
+					  int node, u64 flags,
+					  const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 	s32 cpu;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return -ENODEV;
 
@@ -1300,6 +1324,7 @@ __bpf_kfunc s32 scx_bpf_pick_any_cpu_node(const struct cpumask *cpus_allowed,
  * scx_bpf_pick_any_cpu - Pick and claim an idle cpu if available or pick any CPU
  * @cpus_allowed: Allowed cpumask
  * @flags: %SCX_PICK_IDLE_CPU_* flags
+ * @aux__prog: magic BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Pick and claim an idle cpu in @cpus_allowed. If none is available, pick any
  * CPU in @cpus_allowed. Guaranteed to succeed and returns the picked idle cpu
@@ -1314,14 +1339,15 @@ __bpf_kfunc s32 scx_bpf_pick_any_cpu_node(const struct cpumask *cpus_allowed,
  * scx_bpf_pick_any_cpu_node() instead.
  */
 __bpf_kfunc s32 scx_bpf_pick_any_cpu(const struct cpumask *cpus_allowed,
-				     u64 flags)
+				     u64 flags,
+				     const struct bpf_prog_aux *aux__prog)
 {
 	struct scx_sched *sch;
 	s32 cpu;
 
 	guard(rcu)();
 
-	sch = rcu_dereference(scx_root);
+	sch = scx_prog_sched(aux__prog);
 	if (unlikely(!sch))
 		return -ENODEV;
 
