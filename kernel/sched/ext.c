@@ -274,7 +274,7 @@ static bool scx_is_descendant(struct scx_sched *sch, struct scx_sched *ancestor)
 static struct scx_dispatch_q *find_global_dsq(struct scx_sched *sch,
 					      struct task_struct *p)
 {
-	return sch->global_dsqs[cpu_to_node(task_cpu(p))];
+	return &sch->pnode[cpu_to_node(task_cpu(p))]->global_dsq;
 }
 
 static struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch, u64 dsq_id)
@@ -1965,7 +1965,7 @@ static bool consume_global_dsq(struct scx_sched *sch, struct rq *rq)
 {
 	int node = cpu_to_node(cpu_of(rq));
 
-	return consume_dispatch_q(sch, rq, sch->global_dsqs[node]);
+	return consume_dispatch_q(sch, rq, &sch->pnode[node]->global_dsq);
 }
 
 /**
@@ -3733,8 +3733,8 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 	free_percpu(sch->pcpu);
 
 	for_each_node_state(node, N_POSSIBLE)
-		kfree(sch->global_dsqs[node]);
-	kfree(sch->global_dsqs);
+		kfree(sch->pnode[node]);
+	kfree(sch->pnode);
 
 	rhashtable_walk_enter(&sch->dsq_hash, &rht_iter);
 	do {
@@ -4935,24 +4935,23 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 	if (ret < 0)
 		goto err_free_ei;
 
-	sch->global_dsqs = kcalloc(nr_node_ids, sizeof(sch->global_dsqs[0]),
-				   GFP_KERNEL);
-	if (!sch->global_dsqs) {
+	sch->pnode = kcalloc(nr_node_ids, sizeof(sch->pnode[0]), GFP_KERNEL);
+	if (!sch->pnode) {
 		ret = -ENOMEM;
 		goto err_free_hash;
 	}
 
 	for_each_node_state(node, N_POSSIBLE) {
-		struct scx_dispatch_q *dsq;
+		struct scx_sched_pnode *pnode;
 
-		dsq = kzalloc_node(sizeof(*dsq), GFP_KERNEL, node);
-		if (!dsq) {
+		pnode = kzalloc_node(sizeof(*pnode), GFP_KERNEL, node);
+		if (!pnode) {
 			ret = -ENOMEM;
-			goto err_free_gdsqs;
+			goto err_free_pnode;
 		}
 
-		init_dsq(dsq, SCX_DSQ_GLOBAL, sch);
-		sch->global_dsqs[node] = dsq;
+		init_dsq(&pnode->global_dsq, SCX_DSQ_GLOBAL, sch);
+		sch->pnode[node] = pnode;
 	}
 
 	sch->dsp_max_batch = ops->dispatch_max_batch ?: SCX_DSP_DFL_MAX_BATCH;
@@ -4960,7 +4959,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 						 dsp_ctx.buf, sch->dsp_max_batch),
 				   __alignof__(struct scx_sched_pcpu));
 	if (!sch->pcpu)
-		goto err_free_gdsqs;
+		goto err_free_pnode;
 
 	sch->helper = kthread_run_worker(0, "sched_ext_helper");
 	if (!sch->helper)
@@ -5031,10 +5030,10 @@ err_stop_helper:
 	kthread_stop(sch->helper->task);
 err_free_pcpu:
 	free_percpu(sch->pcpu);
-err_free_gdsqs:
+err_free_pnode:
 	for_each_node_state(node, N_POSSIBLE)
-		kfree(sch->global_dsqs[node]);
-	kfree(sch->global_dsqs);
+		kfree(sch->pnode[node]);
+	kfree(sch->pnode);
 err_free_hash:
 	rhashtable_free_and_destroy(&sch->dsq_hash, NULL, NULL);
 err_free_ei:
