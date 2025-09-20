@@ -140,6 +140,8 @@ struct cgroup *scx_bpf_task_cgroup(struct task_struct *p, const struct bpf_prog_
 #define scx_bpf_task_cgroup(p) scx_bpf_task_cgroup((p), NULL)
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
+bool scx_bpf_sub_dispatch(u64 cgroup_id, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_sub_dispatch(cgroup_id) scx_bpf_sub_dispatch((cgroup_id), NULL)
 
 /*
  * Use the following as @it__iter when calling scx_bpf_dsq_move[_vtime]() from
