@@ -451,11 +451,17 @@ struct scx_task_iter {
 	struct rq_flags			rf;
 	u32				cnt;
 	bool				list_locked;
+#ifdef CONFIG_CGROUPS
+	struct cgroup			*cgrp;
+	struct cgroup_subsys_state	*css_pos;
+	struct css_task_iter		css_iter;
+#endif
 };
 
 /**
  * scx_task_iter_start - Lock scx_tasks_lock and start a task iteration
  * @iter: iterator to init
+ * @cgrp: Optional root of cgroup subhierarchy to iterate
  *
  * Initialize @iter and return with scx_tasks_lock held. Once initialized, @iter
  * must eventually be stopped with scx_task_iter_stop().
@@ -469,8 +475,14 @@ struct scx_task_iter {
  * All tasks which existed when the iteration started are guaranteed to be
  * visited as long as they still exist. Tasks which exit while iteration is in
  * progress may be visited twice. The caller must be able to handle such cases.
+ *
+ * @if @cgrp is NULL, scx_live_tasks are walked followed by scx_dying_tasks. If
+ * @cgrp is not NULL, @cgrp's tasks are walked using css_task_iter followed by
+ * scx_dying_tasks. To guarantee that all tasks are visited at least once, the
+ * caller must be holding scx_fork_rwsem. In the cgroup case, the caller must
+ * also be holding scx_cgroup_rwsem to prevent cgroup task migrations.
  */
-static void scx_task_iter_start(struct scx_task_iter *iter)
+static void scx_task_iter_start(struct scx_task_iter *iter, struct cgroup *cgrp)
 {
 	BUILD_BUG_ON(__SCX_DSQ_ITER_ALL_FLAGS &
 		     ((1U << __SCX_DSQ_LNODE_PRIV_SHIFT) - 1));
@@ -478,8 +490,20 @@ static void scx_task_iter_start(struct scx_task_iter *iter)
 	spin_lock_irq(&scx_tasks_lock);
 
 	iter->head = &scx_live_tasks;
+#ifdef CONFIG_CGROUPS
+	if (cgrp) {
+		iter->cgrp = cgrp;
+		iter->css_pos = css_next_descendant_pre(NULL, &iter->cgrp->self);
+		css_task_iter_start(iter->css_pos, 0, &iter->css_iter);
+		/* walking cgroup tasks instead, skip scx_live_tasks */
+		iter->head = &scx_dying_tasks;
+	} else {
+		iter->cgrp = NULL;
+		iter->css_pos = NULL;
+	}
+#endif
 	iter->cursor = (struct sched_ext_entity){ .flags = SCX_TASK_CURSOR };
-	list_add(&iter->cursor.tasks_node, &scx_live_tasks);
+	list_add(&iter->cursor.tasks_node, iter->head);
 	iter->locked_task = NULL;
 	iter->cnt = 0;
 	iter->list_locked = true;
@@ -530,6 +554,8 @@ static void __scx_task_iter_maybe_relock(struct scx_task_iter *iter)
 static void scx_task_iter_stop(struct scx_task_iter *iter)
 {
 	__scx_task_iter_maybe_relock(iter);
+	if (iter->css_pos)
+		css_task_iter_end(&iter->css_iter);
 	list_del_init(&iter->cursor.tasks_node);
 	scx_task_iter_unlock(iter);
 }
@@ -557,13 +583,45 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
 		__scx_task_iter_maybe_relock(iter);
 	}
 retry:
+
+#ifdef CONFIG_CGROUPS
+	/*
+	 * For cgroup iterations, use css_task_iter for live tasks. iter->head
+	 * is already set to scx_dying_tasks.
+	 */
+	while (iter->css_pos) {
+		struct task_struct *p;
+
+		p = css_task_iter_next(&iter->css_iter);
+		if (p)
+			return p;
+
+		css_task_iter_end(&iter->css_iter);
+		iter->css_pos = css_next_descendant_pre(iter->css_pos,
+							&iter->cgrp->self);
+		if (iter->css_pos)
+			css_task_iter_start(iter->css_pos, 0, &iter->css_iter);
+	}
+#endif
+
 	list_for_each_entry(pos, cursor, tasks_node) {
+		struct task_struct *p = container_of(pos, struct task_struct, scx);
+
 		if (&pos->tasks_node == iter->head)
 			break;
-		if (!(pos->flags & SCX_TASK_CURSOR)) {
-			list_move(cursor, &pos->tasks_node);
-			return container_of(pos, struct task_struct, scx);
-		}
+		if (pos->flags & SCX_TASK_CURSOR)
+			continue;
+#ifdef CONFIG_CGROUPS
+		/*
+		 * For cgroup iterations, this loop is only used for iterating
+		 * dying tasks. Filter out tasks which aren't in the target
+		 * subtree.
+		 */
+		if (iter->cgrp && !task_under_cgroup_hierarchy(p, iter->cgrp))
+			continue;
+#endif
+		list_move(cursor, &pos->tasks_node);
+		return p;
 	}
 
 	if (iter->head == &scx_live_tasks) {
@@ -3936,7 +3994,7 @@ static void scx_disable_workfn(struct kthread_work *work)
 
 	scx_init_task_enabled = false;
 
-	scx_task_iter_start(&sti);
+	scx_task_iter_start(&sti, NULL);
 	while ((p = scx_task_iter_next_locked(&sti))) {
 		/* @p may be being visited twice, doesn't matter */
 		const struct sched_class *old_class = p->sched_class;
@@ -4639,7 +4697,7 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	if (ret)
 		goto err_disable_unlock_all;
 
-	scx_task_iter_start(&sti);
+	scx_task_iter_start(&sti, NULL);
 	while ((p = scx_task_iter_next_locked(&sti))) {
 		/*
 		 * Task iteration may visit the same task twice when racing
@@ -4688,7 +4746,7 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	 * scx_tasks_lock.
 	 */
 	percpu_down_write(&scx_fork_rwsem);
-	scx_task_iter_start(&sti);
+	scx_task_iter_start(&sti, NULL);
 	while ((p = scx_task_iter_next_locked(&sti))) {
 		/* @p may be being visited twice, doesn't matter */
 		const struct sched_class *old_class = p->sched_class;
