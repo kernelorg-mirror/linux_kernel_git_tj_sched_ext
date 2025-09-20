@@ -1581,6 +1581,11 @@ struct bpf_stream_stage {
 
 struct bpf_prog_aux {
 	atomic64_t refcnt;
+
+	/* XXX - See kernel/sched/ext.c::scx_sub_enable() */
+	u64 priv_user;
+	void *priv;
+
 	u32 used_map_cnt;
 	u32 used_btf_cnt;
 	u32 max_ctx_offset;

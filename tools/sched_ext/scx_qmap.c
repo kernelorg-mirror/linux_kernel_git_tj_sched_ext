@@ -99,12 +99,25 @@ int main(int argc, char **argv)
 			break;
 		case 'c': {
 			struct stat st;
+			int fd, len;
+			char buf[19];
 			if (stat(optarg, &st) < 0) {
 				perror("stat");
 				return 1;
 			}
 			skel->struct_ops.qmap_ops->sub_cgroup_id = st.st_ino;
 			skel->rodata->sub_cgroup_id = st.st_ino;
+			fd = open("/sys/module/bpf/parameters/prog_aux_priv", O_RDWR);
+			if (fd < 0) {
+				perror("open(\"/sys/module/bpf/parameters/prog_aux_priv\")");
+				return 1;
+			}
+			len = snprintf(buf, sizeof(buf), "0x%lx", st.st_ino);
+			if (write(fd, buf, len) != len) {
+				perror("write(\"/sys/module/bpf/parameters/prog_aux_priv\")");
+				return 1;
+			}
+			close(fd);
 			break;
 		}
 		case 'd':

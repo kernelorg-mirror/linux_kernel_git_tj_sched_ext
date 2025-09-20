@@ -2761,6 +2761,27 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	}
 }
 
+static int prog_aux_priv_param_set(const char *input, const struct kernel_param *kp)
+{
+	return kstrtoull(input, 0, &current->bpf_prog_aux_priv);
+}
+
+static int prog_aux_priv_param_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", current->bpf_prog_aux_priv);
+}
+
+static const struct kernel_param_ops prog_aux_priv_param_ops = {
+	.set    = prog_aux_priv_param_set,
+	.get    = prog_aux_priv_param_get,
+};
+
+#undef MODULE_PARAM_PREFIX
+#define MODULE_PARAM_PREFIX "bpf."
+module_param_cb(prog_aux_priv, &prog_aux_priv_param_ops, NULL, 0664);
+MODULE_PARM_DESC("prog_aux_priv",
+		 "Set prog->aux->priv to this value for all BPF programs loaded by %current");
+
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
@@ -2898,6 +2919,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 
 	prog->expected_attach_type = attr->expected_attach_type;
 	prog->sleepable = !!(attr->prog_flags & BPF_F_SLEEPABLE);
+	/* XXX - See kernel/sched/ext.c::scx_sub_enable() */
+	prog->aux->priv_user = current->bpf_prog_aux_priv;
 	prog->aux->attach_btf = attach_btf;
 	prog->aux->attach_btf_id = attr->attach_btf_id;
 	prog->aux->dst_prog = dst_prog;

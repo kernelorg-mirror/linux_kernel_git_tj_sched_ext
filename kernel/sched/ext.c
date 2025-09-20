@@ -4116,6 +4116,24 @@ static void scx_sub_disable(struct scx_sched *sch)
 
 	if (sch->ops.exit)
 		SCX_CALL_OP(sch, SCX_KF_UNLOCKED, exit, NULL, sch->exit_info);
+
+	/*
+	 * XXX - NULL prog->aux->priv is interpreted as scx_root, so use an
+	 * ERR_PTR value to mark the associated progs dead. Note that this is
+	 * racy as e.g. a tracepoint program associated with a scheduler which
+	 * hasn't finished scx_sub_enable() yet may end up affecting scx_root
+	 * inadvertently. Plug the hole when this hack is replaced with a proper
+	 * BPF construct.
+	 */
+	u32 prog_id = 0;
+	struct bpf_prog *prog;
+	while ((prog = bpf_prog_get_curr_or_next(&prog_id))) {
+		if (prog->aux->priv == sch)
+			RCU_INIT_POINTER(prog->aux->priv, ERR_PTR(-ENODEV));
+		bpf_prog_put(prog);
+		prog_id++;
+	}
+
 	kobject_del(&sch->kobj);
 }
 #else	/* CONFIG_EXT_SUB_SCHED */
@@ -5146,6 +5164,24 @@ static int scx_sub_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 		scx_error(sch, "max nesting depth %d violated",
 			  SCX_SUB_MAX_DEPTH);
 		goto err_disable;
+	}
+
+	/*
+	 * XXX - We want all BPF programs loaded together with this scheduler
+	 * instance to point to this scheduler instance. BPF currently doesn't
+	 * have such feature so work around with a hack. The loading userspace
+	 * thread sets %current->bpf_prog_aux_priv to the associated cgroup ID
+	 * which gets transferred to bpf->aux->priv_user in bpf_prog_load().
+	 * Here, we can find all progs that have the matching cgroup ID and set
+	 * their prog->aux->priv to $sch.
+	 */
+	u32 prog_id = 0;
+	struct bpf_prog *prog;
+	while ((prog = bpf_prog_get_curr_or_next(&prog_id))) {
+		if (prog->aux->priv_user == cgroup_id(cgrp))
+			rcu_assign_pointer(prog->aux->priv, sch);
+		bpf_prog_put(prog);
+		prog_id++;
 	}
 
 	if (sch->ops.init) {

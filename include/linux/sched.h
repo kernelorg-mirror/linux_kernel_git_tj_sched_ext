@@ -1596,6 +1596,8 @@ struct task_struct {
 	struct bpf_local_storage __rcu	*bpf_storage;
 	/* Used for BPF run context */
 	struct bpf_run_ctx		*bpf_ctx;
+	/* XXX - See kernel/sched/ext.c::scx_sub_enable() */
+	u64				bpf_prog_aux_priv;
 #endif
 	/* Used by BPF for per-TASK xdp storage */
 	struct bpf_net_context		*bpf_net_context;
