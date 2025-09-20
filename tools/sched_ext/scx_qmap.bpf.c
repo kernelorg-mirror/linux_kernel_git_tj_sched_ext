@@ -312,7 +312,7 @@ static bool dispatch_highpri(bool from_timer)
 	s32 this_cpu = bpf_get_smp_processor_id();
 
 	/* scan SHARED_DSQ and move highpri tasks to HIGHPRI_DSQ */
-	bpf_for_each(scx_dsq, p, SHARED_DSQ, 0) {
+	bpf_for_each(scx_dsq, p, SHARED_DSQ, 0, NULL) {
 		static u64 highpri_seq;
 		struct task_ctx *tctx;
 
@@ -334,7 +334,7 @@ static bool dispatch_highpri(bool from_timer)
 	 * Scan HIGHPRI_DSQ and dispatch until a task that can run on this CPU
 	 * is found.
 	 */
-	bpf_for_each(scx_dsq, p, HIGHPRI_DSQ, 0) {
+	bpf_for_each(scx_dsq, p, HIGHPRI_DSQ, 0, NULL) {
 		bool dispatched = false;
 		s32 cpu;
 
@@ -801,7 +801,7 @@ static void dump_shared_dsq(void)
 	bpf_printk("Dumping %d tasks in SHARED_DSQ in reverse order", nr);
 
 	bpf_rcu_read_lock();
-	bpf_for_each(scx_dsq, p, SHARED_DSQ, SCX_DSQ_ITER_REV)
+	bpf_for_each(scx_dsq, p, SHARED_DSQ, SCX_DSQ_ITER_REV, NULL)
 		bpf_printk("%s[%d]", p->comm, p->pid);
 	bpf_rcu_read_unlock();
 }

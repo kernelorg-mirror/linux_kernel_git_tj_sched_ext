@@ -40,6 +40,11 @@ bool scx_bpf_dispatch_from_dsq___compat(struct bpf_iter_scx_dsq *it__iter, struc
 bool scx_bpf_dispatch_vtime_from_dsq___compat(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
 int bpf_cpumask_populate(struct cpumask *dst, void *src, size_t src__sz) __ksym __weak;
 
+/*
+ * XXX TEMPORARY - The followings conflict with prog__aux wrappers. Comment them
+ * out for now.
+ */
+/*
 #define scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags)				\
 	(bpf_ksym_exists(scx_bpf_dsq_insert) ?					\
 	 scx_bpf_dsq_insert((p), (dsq_id), (slice), (enq_flags)) :		\
@@ -54,7 +59,7 @@ int bpf_cpumask_populate(struct cpumask *dst, void *src, size_t src__sz) __ksym 
 	(bpf_ksym_exists(scx_bpf_dsq_move_to_local) ?				\
 	 scx_bpf_dsq_move_to_local((dsq_id)) :					\
 	 scx_bpf_consume___compat((dsq_id)))
-
+*/
 #define __COMPAT_scx_bpf_dsq_move_set_slice(it__iter, slice)			\
 	(bpf_ksym_exists(scx_bpf_dsq_move_set_slice) ?				\
 	 scx_bpf_dsq_move_set_slice((it__iter), (slice)) :			\
