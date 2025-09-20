@@ -962,6 +962,7 @@ void __noreturn do_exit(long code)
 	exit_thread(tsk);
 
 	sched_autogroup_exit_task(tsk);
+	sched_ext_exit(tsk);
 	cgroup_exit(tsk);
 
 	/*

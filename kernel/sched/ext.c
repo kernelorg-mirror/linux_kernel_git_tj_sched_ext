@@ -20,13 +20,21 @@
 static struct scx_sched __rcu *scx_root;
 
 /*
- * During exit, a task may schedule after losing its PIDs. When disabling the
- * BPF scheduler, we need to be able to iterate tasks in every state to
- * guarantee system safety. Maintain a dedicated task list which contains every
- * task between its fork and eventual free.
+ * - We want to visit and perform sleepable operations on every task.
+ *
+ * - During exit, a task may schedule after losing its PIDs. When disabling the
+ *   BPF scheduler, we need to be able to iterate tasks in every state to
+ *   guarantee system safety.
+ *
+ * Maintain a dedicated task list which contains every task between its fork and
+ * eventual free. Live and exiting tasks are kept on separate lists so that the
+ * dying task iteration can be combined with cgroup task iteration. This leads
+ * to occasional double visiting of existing tasks but those aren't difficult
+ * to handle from users.
  */
 static DEFINE_SPINLOCK(scx_tasks_lock);
-static LIST_HEAD(scx_tasks);
+static LIST_HEAD(scx_live_tasks);
+static LIST_HEAD(scx_dying_tasks);
 
 /* ops enable/disable */
 static DEFINE_MUTEX(scx_enable_mutex);
@@ -436,6 +444,7 @@ struct bpf_iter_scx_dsq {
  * SCX task iterator.
  */
 struct scx_task_iter {
+	struct list_head		*head;
 	struct sched_ext_entity		cursor;
 	struct task_struct		*locked_task;
 	struct rq			*rq;
@@ -458,7 +467,8 @@ struct scx_task_iter {
  * RCU read lock or obtaining a reference count.
  *
  * All tasks which existed when the iteration started are guaranteed to be
- * visited as long as they still exist.
+ * visited as long as they still exist. Tasks which exit while iteration is in
+ * progress may be visited twice. The caller must be able to handle such cases.
  */
 static void scx_task_iter_start(struct scx_task_iter *iter)
 {
@@ -467,8 +477,9 @@ static void scx_task_iter_start(struct scx_task_iter *iter)
 
 	spin_lock_irq(&scx_tasks_lock);
 
+	iter->head = &scx_live_tasks;
 	iter->cursor = (struct sched_ext_entity){ .flags = SCX_TASK_CURSOR };
-	list_add(&iter->cursor.tasks_node, &scx_tasks);
+	list_add(&iter->cursor.tasks_node, &scx_live_tasks);
 	iter->locked_task = NULL;
 	iter->cnt = 0;
 	iter->list_locked = true;
@@ -527,9 +538,11 @@ static void scx_task_iter_stop(struct scx_task_iter *iter)
  * scx_task_iter_next - Next task
  * @iter: iterator to walk
  *
- * Visit the next task. See scx_task_iter_start() for details. Locks are dropped
- * and re-acquired every %SCX_TASK_ITER_BATCH iterations to avoid causing stalls
- * by holding scx_tasks_lock for too long.
+ * Visit the next task. Existing tasks may be visited twice. See
+ * scx_task_iter_start() for details.
+ *
+ * Locks are dropped and re-acquired every %SCX_TASK_ITER_BATCH iterations to
+ * avoid causing stalls by holding scx_tasks_lock for too long.
  */
 static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
 {
@@ -543,18 +556,23 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
 		cond_resched();
 		__scx_task_iter_maybe_relock(iter);
 	}
-
+retry:
 	list_for_each_entry(pos, cursor, tasks_node) {
-		if (&pos->tasks_node == &scx_tasks)
-			return NULL;
+		if (&pos->tasks_node == iter->head)
+			break;
 		if (!(pos->flags & SCX_TASK_CURSOR)) {
 			list_move(cursor, &pos->tasks_node);
 			return container_of(pos, struct task_struct, scx);
 		}
 	}
 
-	/* can't happen, should always terminate at scx_tasks above */
-	BUG();
+	if (iter->head == &scx_live_tasks) {
+		iter->head = &scx_dying_tasks;
+		list_move(cursor, iter->head);
+		goto retry;
+	}
+
+	return NULL;
 }
 
 /**
@@ -562,8 +580,8 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
  * @iter: iterator to walk
  *
  * Visit the non-idle task with its rq lock held. Allows callers to specify
- * whether they would like to filter out dead tasks. See scx_task_iter_start()
- * for details.
+ * whether they would like to filter out dead tasks. Exiting tasks may be
+ * visited twice. See scx_task_iter_start() for details.
  */
 static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
 {
@@ -2905,7 +2923,7 @@ void scx_post_fork(struct task_struct *p)
 	}
 
 	spin_lock_irq(&scx_tasks_lock);
-	list_add_tail(&p->scx.tasks_node, &scx_tasks);
+	list_add_tail(&p->scx.tasks_node, &scx_live_tasks);
 	spin_unlock_irq(&scx_tasks_lock);
 
 	percpu_up_read(&scx_fork_rwsem);
@@ -2924,6 +2942,13 @@ void scx_cancel_fork(struct task_struct *p)
 	}
 
 	percpu_up_read(&scx_fork_rwsem);
+}
+
+void sched_ext_exit(struct task_struct *p)
+{
+	spin_lock_irq(&scx_tasks_lock);
+	list_move_tail(&p->scx.tasks_node, &scx_dying_tasks);
+	spin_unlock_irq(&scx_tasks_lock);
 }
 
 void sched_ext_free(struct task_struct *p)
@@ -3913,6 +3938,7 @@ static void scx_disable_workfn(struct kthread_work *work)
 
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
+		/* @p may be being visited twice, doesn't matter */
 		const struct sched_class *old_class = p->sched_class;
 		const struct sched_class *new_class =
 			__setscheduler_class(p->policy, p->prio);
@@ -4616,6 +4642,13 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
 		/*
+		 * Task iteration may visit the same task twice when racing
+		 * against exiting. Skip if @p is already initialized.
+		 */
+		if (scx_get_task_state(p) == SCX_TASK_READY)
+			continue;
+
+		/*
 		 * @p may already be dead, have lost all its usages counts and
 		 * be waiting for RCU grace period before being freed. @p can't
 		 * be initialized for SCX in such cases and should be ignored.
@@ -4657,6 +4690,7 @@ static int scx_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 	percpu_down_write(&scx_fork_rwsem);
 	scx_task_iter_start(&sti);
 	while ((p = scx_task_iter_next_locked(&sti))) {
+		/* @p may be being visited twice, doesn't matter */
 		const struct sched_class *old_class = p->sched_class;
 		const struct sched_class *new_class =
 			__setscheduler_class(p->policy, p->prio);
