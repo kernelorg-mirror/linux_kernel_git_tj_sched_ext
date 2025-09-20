@@ -2178,13 +2178,67 @@ static void flush_dispatch_buf(struct scx_sched *sch, struct rq *rq)
 	dspc->cursor = 0;
 }
 
+static bool scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
+			       struct task_struct *prev)
+{
+	struct scx_dsp_ctx *dspc = this_cpu_ptr(scx_dsp_ctx);
+	bool prev_on_scx = prev->sched_class == &ext_sched_class;
+	int nr_loops = SCX_DSP_MAX_LOOPS;
+
+	if (consume_global_dsq(sch, rq))
+		return true;
+
+	if (unlikely(!SCX_HAS_OP(sch, dispatch)) ||
+	    scx_bypassing(sch, cpu_of(rq)) || !scx_rq_online(rq))
+		return false;
+
+	dspc->rq = rq;
+
+	/*
+	 * The dispatch loop. Because flush_dispatch_buf() may drop the rq lock,
+	 * the local DSQ might still end up empty after a successful
+	 * ops.dispatch(). If the local DSQ is empty even after ops.dispatch()
+	 * produced some tasks, retry. The BPF scheduler may depend on this
+	 * looping behavior to simplify its implementation.
+	 */
+	do {
+		dspc->nr_tasks = 0;
+
+		SCX_CALL_OP(sch, SCX_KF_DISPATCH, dispatch, rq,
+			    cpu_of(rq), prev_on_scx ? prev : NULL);
+
+		flush_dispatch_buf(sch, rq);
+
+		if ((prev->scx.flags & SCX_TASK_QUEUED) && prev->scx.slice) {
+			rq->scx.flags |= SCX_RQ_BAL_KEEP;
+			return true;
+		}
+		if (rq->scx.local_dsq.nr)
+			return true;
+		if (consume_global_dsq(sch, rq))
+			return true;
+
+		/*
+		 * ops.dispatch() can trap us in this loop by repeatedly
+		 * dispatching ineligible tasks. Break out once in a while to
+		 * allow the watchdog to run. As IRQ can't be enabled in
+		 * balance(), we want to complete this scheduling cycle and then
+		 * start a new one. IOW, we want to call resched_curr() on the
+		 * next, most likely idle, task, not the current one. Use
+		 * __scx_bpf_kick_cpu() for deferred kicking.
+		 */
+		if (unlikely(!--nr_loops)) {
+			scx_kick_cpu(sch, cpu_of(rq), 0);
+			break;
+		}
+	} while (dspc->nr_tasks);
+
+	return false;
+}
+
 static int balance_one(struct rq *rq, struct task_struct *prev)
 {
 	struct scx_sched *sch = scx_root;
-	struct scx_dsp_ctx *dspc = this_cpu_ptr(scx_dsp_ctx);
-	bool prev_on_scx = prev->sched_class == &ext_sched_class;
-	bool prev_on_rq = prev->scx.flags & SCX_TASK_QUEUED;
-	int nr_loops = SCX_DSP_MAX_LOOPS;
 
 	lockdep_assert_rq_held(rq);
 	rq->scx.flags |= SCX_RQ_IN_BALANCE;
@@ -2204,7 +2258,7 @@ static int balance_one(struct rq *rq, struct task_struct *prev)
 		rq->scx.cpu_released = false;
 	}
 
-	if (prev_on_scx) {
+	if (prev->sched_class == &ext_sched_class) {
 		update_curr_scx(rq);
 
 		/*
@@ -2217,7 +2271,7 @@ static int balance_one(struct rq *rq, struct task_struct *prev)
 		 * See scx_disable_workfn() for the explanation on the bypassing
 		 * test.
 		 */
-		if (prev_on_rq && prev->scx.slice &&
+		if ((prev->scx.flags & SCX_TASK_QUEUED) && prev->scx.slice &&
 		    !scx_bypassing(sch, cpu_of(rq))) {
 			rq->scx.flags |= SCX_RQ_BAL_KEEP;
 			goto has_tasks;
@@ -2228,60 +2282,15 @@ static int balance_one(struct rq *rq, struct task_struct *prev)
 	if (rq->scx.local_dsq.nr)
 		goto has_tasks;
 
-	if (consume_global_dsq(sch, rq))
+	/* dispatch @sch */
+	if (scx_dispatch_sched(sch, rq, prev))
 		goto has_tasks;
 
-	if (unlikely(!SCX_HAS_OP(sch, dispatch)) ||
-	    scx_bypassing(sch, cpu_of(rq)) || !scx_rq_online(rq))
-		goto no_tasks;
-
-	dspc->rq = rq;
-
-	/*
-	 * The dispatch loop. Because flush_dispatch_buf() may drop the rq lock,
-	 * the local DSQ might still end up empty after a successful
-	 * ops.dispatch(). If the local DSQ is empty even after ops.dispatch()
-	 * produced some tasks, retry. The BPF scheduler may depend on this
-	 * looping behavior to simplify its implementation.
-	 */
-	do {
-		dspc->nr_tasks = 0;
-
-		SCX_CALL_OP(sch, SCX_KF_DISPATCH, dispatch, rq,
-			    cpu_of(rq), prev_on_scx ? prev : NULL);
-
-		flush_dispatch_buf(sch, rq);
-
-		if (prev_on_rq && prev->scx.slice) {
-			rq->scx.flags |= SCX_RQ_BAL_KEEP;
-			goto has_tasks;
-		}
-		if (rq->scx.local_dsq.nr)
-			goto has_tasks;
-		if (consume_global_dsq(sch, rq))
-			goto has_tasks;
-
-		/*
-		 * ops.dispatch() can trap us in this loop by repeatedly
-		 * dispatching ineligible tasks. Break out once in a while to
-		 * allow the watchdog to run. As IRQ can't be enabled in
-		 * balance(), we want to complete this scheduling cycle and then
-		 * start a new one. IOW, we want to call resched_curr() on the
-		 * next, most likely idle, task, not the current one. Use
-		 * scx_kick_cpu() for deferred kicking.
-		 */
-		if (unlikely(!--nr_loops)) {
-			scx_kick_cpu(sch, cpu_of(rq), 0);
-			break;
-		}
-	} while (dspc->nr_tasks);
-
-no_tasks:
 	/*
 	 * Didn't find another task to run. Keep running @prev unless
 	 * %SCX_OPS_ENQ_LAST is in effect.
 	 */
-	if (prev_on_rq &&
+	if ((prev->scx.flags & SCX_TASK_QUEUED) &&
 	    (!(sch->ops.flags & SCX_OPS_ENQ_LAST) ||
 	     scx_bypassing(sch, cpu_of(rq)))) {
 		rq->scx.flags |= SCX_RQ_BAL_KEEP;
