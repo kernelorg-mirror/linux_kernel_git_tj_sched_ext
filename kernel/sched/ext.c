@@ -3496,6 +3496,18 @@ static void schedule_dsq_reenq(struct scx_sched *sch, struct scx_dispatch_q *dsq
 		}
 
 		schedule_deferred(rq);
+	} else if (!(dsq->id & SCX_DSQ_FLAG_BUILTIN)) {
+		struct rq *rq = this_rq();
+		struct scx_dsq_pcpu *dsq_pcpu = per_cpu_ptr(dsq->pcpu, cpu_of(rq));
+
+		scoped_guard (raw_spinlock_irqsave, &rq->scx.deferred_reenq_lock) {
+			if (list_empty(&dsq_pcpu->deferred_reenq_user_node))
+				list_move_tail(&dsq_pcpu->deferred_reenq_user_node,
+					       &rq->scx.deferred_reenq_users);
+			dsq_pcpu->deferred_reenq_user_flags |= reenq_flags;
+		}
+
+		schedule_deferred(rq);
 	} else {
 		scx_error(sch, "DSQ 0x%llx not allowed for reenq", dsq->id);
 	}
@@ -3577,12 +3589,98 @@ static void process_deferred_reenq_locals(struct rq *rq)
 	}
 }
 
+static void reenq_user(struct rq *rq, struct scx_dispatch_q *dsq, u64 reenq_flags)
+{
+	struct rq *locked_rq = rq;
+	struct scx_sched *sch = dsq->sched;
+	struct scx_dsq_list_node cursor = INIT_DSQ_LIST_CURSOR(cursor, dsq, 0);
+	struct task_struct *p;
+	s32 cnt = 0;
+
+	lockdep_assert_rq_held(rq);
+
+	while (likely(!READ_ONCE(sch->bypass_depth))) {
+		struct rq *task_rq;
+
+		raw_spin_lock(&dsq->lock);
+
+		p = nldsq_cursor_next_task(&cursor, dsq);
+		if (!p) {
+			raw_spin_unlock(&dsq->lock);
+			break;
+		}
+
+		task_rq = task_rq(p);
+
+		if (locked_rq != task_rq) {
+			if (locked_rq)
+				raw_spin_rq_unlock(locked_rq);
+			if (unlikely(!raw_spin_rq_trylock(task_rq))) {
+				raw_spin_unlock(&dsq->lock);
+				raw_spin_rq_lock(task_rq);
+				raw_spin_lock(&dsq->lock);
+			}
+			locked_rq = task_rq;
+
+			/* did we lose @p while switching locks? */
+			if (nldsq_cursor_lost_task(&cursor, task_rq, dsq, p))
+				continue;
+		}
+
+		/* @p is on @dsq, its rq and @dsq are locked */
+		dispatch_dequeue_locked(p, dsq);
+		raw_spin_unlock(&dsq->lock);
+		do_enqueue_task(task_rq, p, SCX_ENQ_REENQ, -1);
+
+		if (!(++cnt % SCX_TASK_ITER_BATCH)) {
+			raw_spin_rq_unlock(locked_rq);
+			locked_rq = NULL;
+			cpu_relax();
+		}
+	}
+
+	if (locked_rq != rq) {
+		if (locked_rq)
+			raw_spin_rq_unlock(locked_rq);
+		raw_spin_rq_lock(rq);
+	}
+}
+
+static void process_deferred_reenq_users(struct rq *rq)
+{
+	lockdep_assert_rq_held(rq);
+
+	while (true) {
+		struct scx_dispatch_q *dsq;
+		u64 reenq_flags = 0;
+
+		scoped_guard (raw_spinlock, &rq->scx.deferred_reenq_lock) {
+			struct scx_dsq_pcpu *dsq_pcpu =
+				list_first_entry_or_null(&rq->scx.deferred_reenq_users,
+							 struct scx_dsq_pcpu,
+							 deferred_reenq_user_node);
+			if (!dsq_pcpu)
+				return;
+
+			dsq = dsq_pcpu->dsq;
+			swap(dsq_pcpu->deferred_reenq_user_flags, reenq_flags);
+			list_del_init(&dsq_pcpu->deferred_reenq_user_node);
+		}
+
+		BUG_ON(dsq->id & SCX_DSQ_FLAG_BUILTIN);
+		reenq_user(rq, dsq, reenq_flags);
+	}
+}
+
 static void run_deferred(struct rq *rq)
 {
 	process_ddsp_deferred_locals(rq);
 
 	if (!list_empty(&rq->scx.deferred_reenq_locals))
 		process_deferred_reenq_locals(rq);
+
+	if (!list_empty(&rq->scx.deferred_reenq_users))
+		process_deferred_reenq_users(rq);
 }
 
 #ifdef CONFIG_NO_HZ_FULL
@@ -3902,6 +4000,7 @@ static s32 init_dsq(struct scx_dispatch_q *dsq, u64 dsq_id,
 		struct scx_dsq_pcpu *pcpu = per_cpu_ptr(dsq->pcpu, cpu);
 
 		pcpu->dsq = dsq;
+		INIT_LIST_HEAD(&pcpu->deferred_reenq_user_node);
 	}
 
 	return 0;
@@ -3909,6 +4008,22 @@ static s32 init_dsq(struct scx_dispatch_q *dsq, u64 dsq_id,
 
 static void exit_dsq(struct scx_dispatch_q *dsq)
 {
+	s32 cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct scx_dsq_pcpu *pcpu = per_cpu_ptr(dsq->pcpu, cpu);
+		struct rq *rq = cpu_rq(cpu);
+
+		/*
+		 * There must have been a RCU grace period since the last
+		 * insertion and @dsq should be off the deferred list by now.
+		 */
+		if (WARN_ON_ONCE(!list_empty(&pcpu->deferred_reenq_user_node))) {
+			guard(raw_spinlock_irqsave)(&rq->scx.deferred_reenq_lock);
+			list_del_init(&pcpu->deferred_reenq_user_node);
+		}
+	}
+
 	free_percpu(dsq->pcpu);
 }
 
@@ -7024,6 +7139,7 @@ void __init init_sched_ext_class(void)
 		BUG_ON(!zalloc_cpumask_var_node(&rq->scx.cpus_to_wait, GFP_KERNEL, n));
 		raw_spin_lock_init(&rq->scx.deferred_reenq_lock);
 		INIT_LIST_HEAD(&rq->scx.deferred_reenq_locals);
+		INIT_LIST_HEAD(&rq->scx.deferred_reenq_users);
 		rq->scx.deferred_irq_work = IRQ_WORK_INIT_HARD(deferred_irq_workfn);
 		rq->scx.kick_cpus_irq_work = IRQ_WORK_INIT_HARD(kick_cpus_irq_workfn);
 
@@ -8075,6 +8191,7 @@ __bpf_kfunc struct task_struct *scx_bpf_dsq_peek(u64 dsq_id,
  * supported:
  *
  * - Local DSQs (%SCX_DSQ_LOCAL or %SCX_DSQ_LOCAL_ON | $cpu)
+ * - User DSQs
  *
  * Re-enqueues are performed asynchronously. Can be called from anywhere.
  */

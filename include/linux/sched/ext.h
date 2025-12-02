@@ -64,6 +64,8 @@ enum scx_dsq_id_flags {
 
 struct scx_dsq_pcpu {
 	struct scx_dispatch_q	*dsq;
+	struct list_head	deferred_reenq_user_node;
+	u64			deferred_reenq_user_flags;
 };
 
 /*
