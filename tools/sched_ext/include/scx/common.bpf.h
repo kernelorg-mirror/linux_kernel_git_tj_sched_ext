@@ -58,47 +58,78 @@ static inline void ___vmlinux_h_sanity_check___(void)
 		       "bpftool generated vmlinux.h is missing high bits for 64bit enums, upgrade clang and pahole");
 }
 
-s32 scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
-s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle) __ksym;
+/*
+ * XXX TEMPORARY - Each macro that has the same name as the preceding kfunc is
+ * to work around aux__prog issue. This causes a whole bunch of other problems.
+ * This is to work around just enough for testing and verification for now.
+ */
+s32 scx_bpf_create_dsq(u64 dsq_id, s32 node, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_create_dsq(dsq_id, node) scx_bpf_create_dsq((dsq_id), (node), NULL)
+s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, is_idle) scx_bpf_select_cpu_dfl((p), (prev_cpu), (wake_flags), (is_idle), NULL)
 s32 __scx_bpf_select_cpu_and(struct task_struct *p, const struct cpumask *cpus_allowed,
-			     struct scx_bpf_select_cpu_and_args *args) __ksym __weak;
+			     struct scx_bpf_select_cpu_and_args *args,
+			     const struct bpf_prog_aux *aux__prog) __ksym __weak;
 bool __scx_bpf_dsq_insert_vtime(struct task_struct *p, struct scx_bpf_dsq_insert_vtime_args *args) __ksym __weak;
-u32 scx_bpf_dispatch_nr_slots(void) __ksym;
-void scx_bpf_dispatch_cancel(void) __ksym;
-void scx_bpf_kick_cpu(s32 cpu, u64 flags) __ksym;
+u32 scx_bpf_dispatch_nr_slots(const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_dispatch_nr_slots() scx_bpf_dispatch_nr_slots(NULL)
+void scx_bpf_dispatch_cancel(const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_dispatch_cancel() scx_bpf_dispatch_cancel(NULL)
+void scx_bpf_kick_cpu(s32 cpu, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_kick_cpu(cpu, flags) scx_bpf_kick_cpu((cpu), (flags), NULL)
 s32 scx_bpf_dsq_nr_queued(u64 dsq_id) __ksym;
 void scx_bpf_destroy_dsq(u64 dsq_id) __ksym;
 struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym __weak;
-int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags) __ksym __weak;
+int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+//#define bpf_iter_scx_dsq_new(it, dsq_id, flags) bpf_iter_scx_dsq_new((it), (dsq_id), (flags), NULL)
 struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it) __ksym __weak;
 void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it) __ksym __weak;
-void scx_bpf_exit_bstr(s64 exit_code, char *fmt, unsigned long long *data, u32 data__sz) __ksym __weak;
-void scx_bpf_error_bstr(char *fmt, unsigned long long *data, u32 data_len) __ksym;
-void scx_bpf_dump_bstr(char *fmt, unsigned long long *data, u32 data_len) __ksym __weak;
-u32 scx_bpf_cpuperf_cap(s32 cpu) __ksym __weak;
-u32 scx_bpf_cpuperf_cur(s32 cpu) __ksym __weak;
-void scx_bpf_cpuperf_set(s32 cpu, u32 perf) __ksym __weak;
+void scx_bpf_exit_bstr(s64 exit_code, char *fmt, unsigned long long *data, u32 data__sz, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_exit_bstr(exit_code, fmt, data, data__sz) scx_bpf_exit_bstr((exit_code), (fmt), (data), (data__sz), NULL)
+void scx_bpf_error_bstr(char *fmt, unsigned long long *data, u32 data__sz, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_error_bstr(fmt, data, data__sz) scx_bpf_error_bstr((fmt), (data), (data__sz), NULL)
+void scx_bpf_dump_bstr(char *fmt, unsigned long long *data, u32 data__sz, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_dump_bstr(fmt, data, data__sz) scx_bpf_dump_bstr((fmt), (data), (data__sz), NULL)
+u32 scx_bpf_cpuperf_cap(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_cpuperf_cap(cpu) scx_bpf_cpuperf_cap((cpu), NULL)
+u32 scx_bpf_cpuperf_cur(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_cpuperf_cur(cpu) scx_bpf_cpuperf_cur((cpu), NULL)
+void scx_bpf_cpuperf_set(s32 cpu, u32 perf, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_cpuperf_set(cpu, perf) scx_bpf_cpuperf_set((cpu), (perf), NULL)
 u32 scx_bpf_nr_node_ids(void) __ksym __weak;
 u32 scx_bpf_nr_cpu_ids(void) __ksym __weak;
-int scx_bpf_cpu_node(s32 cpu) __ksym __weak;
+int scx_bpf_cpu_node(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_cpu_node(cpu) scx_bpf_cpu_node((cpu), NULL)
 const struct cpumask *scx_bpf_get_possible_cpumask(void) __ksym __weak;
 const struct cpumask *scx_bpf_get_online_cpumask(void) __ksym __weak;
 void scx_bpf_put_cpumask(const struct cpumask *cpumask) __ksym __weak;
-const struct cpumask *scx_bpf_get_idle_cpumask_node(int node) __ksym __weak;
-const struct cpumask *scx_bpf_get_idle_cpumask(void) __ksym;
-const struct cpumask *scx_bpf_get_idle_smtmask_node(int node) __ksym __weak;
-const struct cpumask *scx_bpf_get_idle_smtmask(void) __ksym;
+const struct cpumask *scx_bpf_get_idle_cpumask_node(int node, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_get_idle_cpumask_node(node) scx_bpf_get_idle_cpumask_node((node), NULL)
+const struct cpumask *scx_bpf_get_idle_cpumask(const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_get_idle_cpumask() scx_bpf_get_idle_cpumask(NULL)
+const struct cpumask *scx_bpf_get_idle_smtmask_node(int node, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_get_idle_smtmask_node(node) scx_bpf_get_idle_smtmask_node((node), NULL)
+const struct cpumask *scx_bpf_get_idle_smtmask(const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_get_idle_smtmask() scx_bpf_get_idle_smtmask(NULL)
 void scx_bpf_put_idle_cpumask(const struct cpumask *cpumask) __ksym;
-bool scx_bpf_test_and_clear_cpu_idle(s32 cpu) __ksym;
-s32 scx_bpf_pick_idle_cpu_node(const cpumask_t *cpus_allowed, int node, u64 flags) __ksym __weak;
-s32 scx_bpf_pick_idle_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
-s32 scx_bpf_pick_any_cpu_node(const cpumask_t *cpus_allowed, int node, u64 flags) __ksym __weak;
-s32 scx_bpf_pick_any_cpu(const cpumask_t *cpus_allowed, u64 flags) __ksym;
+bool scx_bpf_test_and_clear_cpu_idle(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_test_and_clear_cpu_idle(cpu) scx_bpf_test_and_clear_cpu_idle((cpu), NULL)
+s32 scx_bpf_pick_idle_cpu_node(const cpumask_t *cpus_allowed, int node, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_pick_idle_cpu_node(cpus_allowed, node, flags) scx_bpf_pick_idle_cpu_node((cpus_allowed), (node), (flags), NULL)
+s32 scx_bpf_pick_idle_cpu(const cpumask_t *cpus_allowed, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_pick_idle_cpu(cpus_allowed, flags) scx_bpf_pick_idle_cpu((cpus_allowed), (flags), NULL)
+s32 scx_bpf_pick_any_cpu_node(const cpumask_t *cpus_allowed, int node, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_pick_any_cpu_node(cpus_allowed, node, flags) scx_bpf_pick_any_cpu_node((cpus_allowed), (node), (flags), NULL)
+s32 scx_bpf_pick_any_cpu(const cpumask_t *cpus_allowed, u64 flags, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_pick_any_cpu(cpus_allowed, flags) scx_bpf_pick_any_cpu((cpus_allowed), (flags), NULL)
 bool scx_bpf_task_running(const struct task_struct *p) __ksym;
 s32 scx_bpf_task_cpu(const struct task_struct *p) __ksym;
-struct rq *scx_bpf_cpu_rq(s32 cpu) __ksym;
-struct rq *scx_bpf_locked_rq(void) __ksym;
-struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym __weak;
+struct rq *scx_bpf_cpu_rq(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_cpu_rq(cpu) scx_bpf_cpu_rq((cpu), NULL)
+struct rq *scx_bpf_locked_rq(const struct bpf_prog_aux *aux__prog) __ksym;
+#define scx_bpf_locked_rq() scx_bpf_locked_rq(NULL)
+struct task_struct *scx_bpf_cpu_curr(s32 cpu, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_cpu_curr(cpu) scx_bpf_cpu_curr((cpu), NULL)
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
 bool scx_bpf_sub_dispatch(u64 cgroup_id, const struct bpf_prog_aux *aux__prog) __ksym __weak;

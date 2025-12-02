@@ -16,11 +16,11 @@
 })
 
 /* v6.12: 819513666966 ("sched_ext: Add cgroup support") */
-struct cgroup *scx_bpf_task_cgroup___new(struct task_struct *p) __ksym __weak;
+struct cgroup *scx_bpf_task_cgroup___new(struct task_struct *p, const struct bpf_prog_aux *aux__prog) __ksym __weak;
 
 #define scx_bpf_task_cgroup(p)							\
 	(bpf_ksym_exists(scx_bpf_task_cgroup___new) ?				\
-	 scx_bpf_task_cgroup___new((p)) : NULL)
+	 scx_bpf_task_cgroup___new((p), NULL) : NULL)
 
 /*
  * v6.13: The verb `dispatch` was too overloaded and confusing. kfuncs are
@@ -29,7 +29,7 @@ struct cgroup *scx_bpf_task_cgroup___new(struct task_struct *p) __ksym __weak;
  * scx_bpf_dispatch_from_dsq() and friends were added during v6.12 by
  * 4c30f5ce4f7a ("sched_ext: Implement scx_bpf_dispatch[_vtime]_from_dsq()").
  */
-bool scx_bpf_dsq_move_to_local___new(u64 dsq_id) __ksym __weak;
+bool scx_bpf_dsq_move_to_local___new(u64 dsq_id, const struct bpf_prog_aux *aux__prog) __ksym __weak;
 void scx_bpf_dsq_move_set_slice___new(struct bpf_iter_scx_dsq *it__iter, u64 slice) __ksym __weak;
 void scx_bpf_dsq_move_set_vtime___new(struct bpf_iter_scx_dsq *it__iter, u64 vtime) __ksym __weak;
 bool scx_bpf_dsq_move___new(struct bpf_iter_scx_dsq *it__iter, struct task_struct *p, u64 dsq_id, u64 enq_flags) __ksym __weak;
@@ -43,7 +43,7 @@ bool scx_bpf_dispatch_vtime_from_dsq___old(struct bpf_iter_scx_dsq *it__iter, st
 
 #define scx_bpf_dsq_move_to_local(dsq_id)					\
 	(bpf_ksym_exists(scx_bpf_dsq_move_to_local___new) ?			\
-	 scx_bpf_dsq_move_to_local___new((dsq_id)) :				\
+	 scx_bpf_dsq_move_to_local___new((dsq_id), NULL) :			\
 	 scx_bpf_consume___old((dsq_id)))
 
 #define scx_bpf_dsq_move_set_slice(it__iter, slice)				\
@@ -97,7 +97,7 @@ static inline struct task_struct *__COMPAT_scx_bpf_dsq_peek(u64 dsq_id)
 
 	if (bpf_ksym_exists(scx_bpf_dsq_peek))
 		return scx_bpf_dsq_peek(dsq_id);
-	if (!bpf_iter_scx_dsq_new(&it, dsq_id, 0))
+	if (!bpf_iter_scx_dsq_new(&it, dsq_id, 0, NULL))
 		p = bpf_iter_scx_dsq_next(&it);
 	bpf_iter_scx_dsq_destroy(&it);
 	return p;
@@ -259,7 +259,7 @@ scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 			.flags = flags,
 		};
 
-		return __scx_bpf_select_cpu_and(p, cpus_allowed, &args);
+		return __scx_bpf_select_cpu_and(p, cpus_allowed, &args, NULL);
 	} else {
 		return scx_bpf_select_cpu_and___compat(p, prev_cpu, wake_flags,
 						       cpus_allowed, flags);
@@ -310,7 +310,8 @@ scx_bpf_dsq_insert_vtime(struct task_struct *p, u64 dsq_id, u64 slice, u64 vtime
  * v6.13: scx_bpf_dsq_insert() renaming is also handled here. See the block on
  * dispatch renaming above for more details.
  */
-bool scx_bpf_dsq_insert___v2___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
+bool scx_bpf_dsq_insert___v2___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags,
+				      const struct bpf_prog_aux *aux__prog) __ksym __weak;
 void scx_bpf_dsq_insert___v1(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
 void scx_bpf_dispatch___compat(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags) __ksym __weak;
 
@@ -318,7 +319,7 @@ static inline bool
 scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags)
 {
 	if (bpf_ksym_exists(scx_bpf_dsq_insert___v2___compat)) {
-		return scx_bpf_dsq_insert___v2___compat(p, dsq_id, slice, enq_flags);
+		return scx_bpf_dsq_insert___v2___compat(p, dsq_id, slice, enq_flags, NULL);
 	} else if (bpf_ksym_exists(scx_bpf_dsq_insert___v1)) {
 		scx_bpf_dsq_insert___v1(p, dsq_id, slice, enq_flags);
 		return true;
@@ -333,13 +334,13 @@ scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id, u64 slice, u64 enq_flags)
  * sub-sched authority checks. Drop the wrappers and move the decls to
  * common.bpf.h after v6.22.
  */
-bool scx_bpf_task_set_slice___new(struct task_struct *p, u64 slice) __ksym __weak;
-bool scx_bpf_task_set_dsq_vtime___new(struct task_struct *p, u64 vtime) __ksym __weak;
+bool scx_bpf_task_set_slice___new(struct task_struct *p, u64 slice, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+bool scx_bpf_task_set_dsq_vtime___new(struct task_struct *p, u64 vtime, const struct bpf_prog_aux *aux__prog) __ksym __weak;
 
 static inline void scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
 {
 	if (bpf_ksym_exists(scx_bpf_task_set_slice___new))
-		scx_bpf_task_set_slice___new(p, slice);
+		scx_bpf_task_set_slice___new(p, slice, NULL);
 	else
 		p->scx.slice = slice;
 }
@@ -347,7 +348,7 @@ static inline void scx_bpf_task_set_slice(struct task_struct *p, u64 slice)
 static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
 {
 	if (bpf_ksym_exists(scx_bpf_task_set_dsq_vtime___new))
-		scx_bpf_task_set_dsq_vtime___new(p, vtime);
+		scx_bpf_task_set_dsq_vtime___new(p, vtime, NULL);
 	else
 		p->scx.dsq_vtime = vtime;
 }
@@ -360,7 +361,7 @@ static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
  * v6.22.
  */
 u32 scx_bpf_reenqueue_local___v1(void) __ksym __weak;
-void scx_bpf_reenqueue_local___v2___compat(void) __ksym __weak;
+void scx_bpf_reenqueue_local___v2___compat(const struct bpf_prog_aux *aux__prog) __ksym __weak;
 
 static inline bool __COMPAT_scx_bpf_reenqueue_local_from_anywhere(void)
 {
@@ -370,7 +371,7 @@ static inline bool __COMPAT_scx_bpf_reenqueue_local_from_anywhere(void)
 static inline void scx_bpf_reenqueue_local(void)
 {
 	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
-		scx_bpf_reenqueue_local___v2___compat();
+		scx_bpf_reenqueue_local___v2___compat(NULL);
 	else
 		scx_bpf_reenqueue_local___v1();
 }
