@@ -966,6 +966,7 @@ struct scx_sched_pcpu {
 	struct scx_event_stats	event_stats;
 
 	struct list_head	deferred_reenq_local_node;
+	u64			deferred_reenq_local_flags;
 	struct scx_dispatch_q	bypass_dsq;
 #ifdef CONFIG_EXT_SUB_SCHED
 	u32			bypass_host_seq;
@@ -1115,6 +1116,13 @@ enum scx_deq_flags {
 	 * it hasn't been dispatched yet. Dequeue from the BPF side.
 	 */
 	SCX_DEQ_CORE_SCHED_EXEC	= 1LLU << 32,
+};
+
+enum scx_reenq_flags {
+	/* low 16bits determine which tasks should be reenqueued */
+	SCX_REENQ_ANY		= 1LLU << 0,	/* all tasks */
+
+	__SCX_REENQ_FILTER_MASK	= 0xffffLLU,
 };
 
 enum scx_pick_idle_cpu_flags {
