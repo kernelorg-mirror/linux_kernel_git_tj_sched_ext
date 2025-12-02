@@ -3442,21 +3442,27 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq)
 	return nr_enqueued;
 }
 
+static void process_deferred_reenq_locals(struct rq *rq)
+{
+	struct scx_sched_pcpu *sch_pcpu, *sch_pcpu_n;
+
+	lockdep_assert_rq_held(rq);
+
+	guard(raw_spinlock)(&rq->scx.deferred_reenq_lock);
+
+	list_for_each_entry_safe(sch_pcpu, sch_pcpu_n, &rq->scx.deferred_reenq_locals,
+				 deferred_reenq_local_node) {
+		list_del_init(&sch_pcpu->deferred_reenq_local_node);
+		reenq_local(sch_pcpu->sch, rq);
+	}
+}
+
 static void run_deferred(struct rq *rq)
 {
 	process_ddsp_deferred_locals(rq);
 
-	if (!llist_empty(&rq->scx.deferred_reenq_locals)) {
-		struct llist_node *llist =
-			llist_del_all(&rq->scx.deferred_reenq_locals);
-		struct scx_sched_pcpu *pos, *next;
-
-		llist_for_each_entry_safe(pos, next, llist,
-					  deferred_reenq_locals_node) {
-			init_llist_node(&pos->deferred_reenq_locals_node);
-			reenq_local(pos->sch, rq);
-		}
-	}
+	if (!list_empty(&rq->scx.deferred_reenq_locals))
+		process_deferred_reenq_locals(rq);
 }
 
 #ifdef CONFIG_NO_HZ_FULL
@@ -3973,13 +3979,13 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 
 	/*
 	 * $sch would have entered bypass mode before the RCU grace period. As
-	 * that blocks new deferrals, all deferred_reenq_locals_node's must be
+	 * that blocks new deferrals, all deferred_reenq_local_node's must be
 	 * off-list by now.
 	 */
 	for_each_possible_cpu(cpu) {
 		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
 
-		WARN_ON_ONCE(llist_on_list(&pcpu->deferred_reenq_locals_node));
+		WARN_ON_ONCE(!list_empty(&pcpu->deferred_reenq_local_node));
 	}
 
 	free_percpu(sch->pcpu);
@@ -5580,7 +5586,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
 
 		pcpu->sch = sch;
-		init_llist_node(&pcpu->deferred_reenq_locals_node);
+		INIT_LIST_HEAD(&pcpu->deferred_reenq_local_node);
 	}
 
 	sch->helper = kthread_run_worker(0, "sched_ext_helper");
@@ -6856,7 +6862,8 @@ void __init init_sched_ext_class(void)
 		BUG_ON(!zalloc_cpumask_var_node(&rq->scx.cpus_to_kick_if_idle, GFP_KERNEL, n));
 		BUG_ON(!zalloc_cpumask_var_node(&rq->scx.cpus_to_preempt, GFP_KERNEL, n));
 		BUG_ON(!zalloc_cpumask_var_node(&rq->scx.cpus_to_wait, GFP_KERNEL, n));
-		init_llist_head(&rq->scx.deferred_reenq_locals);
+		raw_spin_lock_init(&rq->scx.deferred_reenq_lock);
+		INIT_LIST_HEAD(&rq->scx.deferred_reenq_locals);
 		rq->scx.deferred_irq_work = IRQ_WORK_INIT_HARD(deferred_irq_workfn);
 		rq->scx.kick_cpus_irq_work = IRQ_WORK_INIT_HARD(kick_cpus_irq_workfn);
 
@@ -8095,7 +8102,6 @@ __bpf_kfunc void scx_bpf_reenqueue_local___v2(const struct bpf_prog_aux *aux__pr
 	unsigned long flags;
 	struct scx_sched *sch;
 	struct rq *rq;
-	struct llist_node *lnode;
 
 	raw_local_irq_save(flags);
 
@@ -8111,9 +8117,14 @@ __bpf_kfunc void scx_bpf_reenqueue_local___v2(const struct bpf_prog_aux *aux__pr
 		goto out_irq_restore;
 
 	rq = this_rq();
-	lnode = &this_cpu_ptr(sch->pcpu)->deferred_reenq_locals_node;
-	if (!llist_on_list(lnode))
-		llist_add(lnode, &rq->scx.deferred_reenq_locals);
+	scoped_guard (raw_spinlock, &rq->scx.deferred_reenq_lock) {
+		struct scx_sched_pcpu *pcpu = this_cpu_ptr(sch->pcpu);
+
+		if (list_empty(&pcpu->deferred_reenq_local_node))
+			list_move_tail(&pcpu->deferred_reenq_local_node,
+				       &rq->scx.deferred_reenq_locals);
+	}
+
 	schedule_deferred(rq);
 out_irq_restore:
 	raw_local_irq_restore(flags);
