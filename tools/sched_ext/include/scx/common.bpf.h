@@ -101,6 +101,8 @@ struct rq *scx_bpf_locked_rq(void) __ksym;
 struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym __weak;
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
+bool scx_bpf_sub_dispatch(u64 cgroup_id, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+#define scx_bpf_sub_dispatch(cgroup_id) scx_bpf_sub_dispatch((cgroup_id), NULL)
 
 /*
  * Use the following as @it__iter when calling scx_bpf_dsq_move[_vtime]() from
