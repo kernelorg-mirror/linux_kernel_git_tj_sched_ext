@@ -19,7 +19,7 @@ static DEFINE_RAW_SPINLOCK(scx_sched_lock);
  * are used as temporary markers to indicate that the dereferences need to be
  * updated to point to the associated scheduler instances rather than scx_root.
  */
-static struct scx_sched __rcu *scx_root;
+struct scx_sched __rcu *scx_root;
 
 /*
  * All scheds, writers must hold both scx_enable_mutex and scx_sched_lock.
@@ -296,9 +296,15 @@ static struct scx_sched *scx_next_descendant_pre(struct scx_sched *pos,
 
 	return NULL;
 }
+
+static void scx_set_task_sched(struct task_struct *p, struct scx_sched *sch)
+{
+	rcu_assign_pointer(p->scx.sched, sch);
+}
 #else	/* CONFIG_EXT_SUB_SCHED */
 static struct scx_sched *scx_parent(struct scx_sched *sch) { return NULL; }
 static struct scx_sched *scx_next_descendant_pre(struct scx_sched *pos, struct scx_sched *root) { return pos ? NULL : root; }
+static void scx_set_task_sched(struct task_struct *p, struct scx_sched *sch) {}
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
 /**
@@ -1464,7 +1470,7 @@ static bool scx_rq_online(struct rq *rq)
 static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 			    int sticky_cpu)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 	struct task_struct **ddsp_taskp;
 	struct scx_dispatch_q *dsq;
 	unsigned long qseq;
@@ -1588,7 +1594,7 @@ static void clr_task_runnable(struct task_struct *p, bool reset_runnable_at)
 
 static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int enq_flags)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 	int sticky_cpu = p->scx.sticky_cpu;
 
 	if (enq_flags & ENQUEUE_WAKEUP)
@@ -1635,7 +1641,7 @@ out:
 
 static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 	unsigned long opss;
 
 	/* dequeue is always temporary, don't reset runnable_at */
@@ -1684,7 +1690,7 @@ static void ops_dequeue(struct rq *rq, struct task_struct *p, u64 deq_flags)
 
 static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	if (!(p->scx.flags & SCX_TASK_QUEUED)) {
 		WARN_ON_ONCE(task_runnable(p));
@@ -1728,8 +1734,8 @@ static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int deq_flags
 
 static void yield_task_scx(struct rq *rq)
 {
-	struct scx_sched *sch = scx_root;
 	struct task_struct *p = rq->curr;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	if (SCX_HAS_OP(sch, yield))
 		SCX_CALL_OP_2TASKS_RET(sch, SCX_KF_REST, yield, rq, p, NULL);
@@ -1739,10 +1745,10 @@ static void yield_task_scx(struct rq *rq)
 
 static bool yield_to_task_scx(struct rq *rq, struct task_struct *to)
 {
-	struct scx_sched *sch = scx_root;
 	struct task_struct *from = rq->curr;
+	struct scx_sched *sch = scx_task_sched(from);
 
-	if (SCX_HAS_OP(sch, yield))
+	if (SCX_HAS_OP(sch, yield) && sch == scx_task_sched(to))
 		return SCX_CALL_OP_2TASKS_RET(sch, SCX_KF_REST, yield, rq,
 					      from, to);
 	else
@@ -2402,7 +2408,7 @@ static void process_ddsp_deferred_locals(struct rq *rq)
 	 */
 	while ((p = list_first_entry_or_null(&rq->scx.ddsp_deferred_locals,
 				struct task_struct, scx.dsq_list.node))) {
-		struct scx_sched *sch = scx_root;
+		struct scx_sched *sch = scx_task_sched(p);
 		struct scx_dispatch_q *dsq;
 
 		list_del_init(&p->scx.dsq_list.node);
@@ -2416,7 +2422,7 @@ static void process_ddsp_deferred_locals(struct rq *rq)
 
 static void set_next_task_scx(struct rq *rq, struct task_struct *p, bool first)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	if (p->scx.flags & SCX_TASK_QUEUED) {
 		/*
@@ -2513,7 +2519,7 @@ static void switch_class(struct rq *rq, struct task_struct *next)
 static void put_prev_task_scx(struct rq *rq, struct task_struct *p,
 			      struct task_struct *next)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	/* see kick_cpus_irq_workfn() */
 	smp_store_release(&rq->scx.kick_sync, rq->scx.kick_sync + 1);
@@ -2608,7 +2614,7 @@ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
 	if (keep_prev) {
 		p = prev;
 		if (!p->scx.slice)
-			refill_task_slice_dfl(rcu_dereference_sched(scx_root), p);
+			refill_task_slice_dfl(scx_task_sched(p), p);
 	} else {
 		p = first_local_task(rq);
 		if (!p) {
@@ -2619,7 +2625,7 @@ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
 		}
 
 		if (unlikely(!p->scx.slice)) {
-			struct scx_sched *sch = rcu_dereference_sched(scx_root);
+			struct scx_sched *sch = scx_task_sched(p);
 
 			if (!scx_rq_bypassing(rq) && !sch->warned_zero_slice) {
 				printk_deferred(KERN_WARNING "sched_ext: %s[%d] has zero slice in %s()\n",
@@ -2680,7 +2686,7 @@ bool scx_prio_less(const struct task_struct *a, const struct task_struct *b,
 
 static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flags)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 	bool rq_bypass;
 
 	/*
@@ -2741,7 +2747,7 @@ static void task_woken_scx(struct rq *rq, struct task_struct *p)
 static void set_cpus_allowed_scx(struct task_struct *p,
 				 struct affinity_context *ac)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	set_cpus_allowed_common(p, ac);
 
@@ -2882,7 +2888,7 @@ void scx_tick(struct rq *rq)
 
 static void task_tick_scx(struct rq *rq, struct task_struct *curr, int queued)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(curr);
 
 	update_curr_scx(rq);
 
@@ -3058,11 +3064,12 @@ static void scx_disable_task(struct task_struct *p)
 
 static void scx_exit_task(struct task_struct *p)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 	struct scx_exit_task_args args = {
 		.cancelled = false,
 	};
 
+	lockdep_assert_held(&p->pi_lock);
 	lockdep_assert_rq_held(task_rq(p));
 
 	switch (scx_get_task_state(p)) {
@@ -3084,6 +3091,7 @@ static void scx_exit_task(struct task_struct *p)
 	if (SCX_HAS_OP(sch, exit_task))
 		SCX_CALL_OP_TASK(sch, SCX_KF_REST, exit_task, task_rq(p),
 				 p, &args);
+	scx_set_task_sched(p, NULL);
 	scx_set_task_state(p, SCX_TASK_NONE);
 }
 
@@ -3113,12 +3121,18 @@ void scx_pre_fork(struct task_struct *p)
 
 int scx_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 {
+	s32 ret;
+
 	percpu_rwsem_assert_held(&scx_fork_rwsem);
 
-	if (scx_init_task_enabled)
-		return scx_init_task(p, task_group(p), true);
-	else
-		return 0;
+	if (scx_init_task_enabled) {
+		ret = scx_init_task(p, task_group(p), true);
+		if (!ret)
+			scx_set_task_sched(p, scx_root);
+		return ret;
+	}
+
+	return 0;
 }
 
 void scx_post_fork(struct task_struct *p)
@@ -3188,7 +3202,7 @@ void sched_ext_dead(struct task_struct *p)
 static void reweight_task_scx(struct rq *rq, struct task_struct *p,
 			      const struct load_weight *lw)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	lockdep_assert_rq_held(task_rq(p));
 
@@ -3204,7 +3218,7 @@ static void prio_changed_scx(struct rq *rq, struct task_struct *p, u64 oldprio)
 
 static void switching_to_scx(struct rq *rq, struct task_struct *p)
 {
-	struct scx_sched *sch = scx_root;
+	struct scx_sched *sch = scx_task_sched(p);
 
 	scx_enable_task(p);
 
@@ -3850,7 +3864,7 @@ bool scx_allow_ttwu_queue(const struct task_struct *p)
 	if (!scx_enabled())
 		return true;
 
-	sch = rcu_dereference_sched(scx_root);
+	sch = scx_task_sched(p);
 	if (unlikely(!sch))
 		return true;
 
@@ -5347,6 +5361,7 @@ static s32 scx_root_enable(struct sched_ext_ops *ops, struct bpf_link *link)
 			goto err_disable_unlock_all;
 		}
 
+		scx_set_task_sched(p, sch);
 		scx_set_task_state(p, SCX_TASK_READY);
 
 		put_task_struct(p);
