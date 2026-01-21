@@ -15,7 +15,7 @@ extern void __WARN_trap(struct bug_entry *bug, ...);
 /*
  * Despite that some emulators terminate on UD2, we use it for WARN().
  */
-#define ASM_UD2		_ASM_BYTES(0x0f, 0x0b)
+#define ASM_UD2		__ASM_FORM(ud2)
 #define INSN_UD2	0x0b0f
 #define LEN_UD2		2
 
@@ -129,7 +129,7 @@ do {								\
 
 #define __WARN_FLAGS(cond_str, flags)					\
 do {									\
-	__auto_type __flags = BUGFLAG_WARNING|(flags);			\
+	auto __flags = BUGFLAG_WARNING|(flags);				\
 	instrumentation_begin();					\
 	_BUG_FLAGS(cond_str, ASM_UD2, __flags, ARCH_WARN_REACHABLE);	\
 	instrumentation_end();						\
