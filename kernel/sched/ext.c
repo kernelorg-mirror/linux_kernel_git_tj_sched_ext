@@ -4021,15 +4021,42 @@ DEFINE_SCHED_CLASS(ext) = {
 #endif
 };
 
-static void init_dsq(struct scx_dispatch_q *dsq, u64 dsq_id,
-		     struct scx_sched *sch)
+static s32 init_dsq(struct scx_dispatch_q *dsq, u64 dsq_id,
+		    struct scx_sched *sch)
 {
+	s32 cpu;
+
 	memset(dsq, 0, sizeof(*dsq));
 
 	raw_spin_lock_init(&dsq->lock);
 	INIT_LIST_HEAD(&dsq->list);
 	dsq->id = dsq_id;
 	dsq->sched = sch;
+
+	dsq->pcpu = alloc_percpu(struct scx_dsq_pcpu);
+	if (!dsq->pcpu)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu) {
+		struct scx_dsq_pcpu *pcpu = per_cpu_ptr(dsq->pcpu, cpu);
+
+		pcpu->dsq = dsq;
+	}
+
+	return 0;
+}
+
+static void exit_dsq(struct scx_dispatch_q *dsq)
+{
+	free_percpu(dsq->pcpu);
+}
+
+static void free_dsq_rcufn(struct rcu_head *rcu)
+{
+	struct scx_dispatch_q *dsq = container_of(rcu, struct scx_dispatch_q, rcu);
+
+	exit_dsq(dsq);
+	kfree(dsq);
 }
 
 static void free_dsq_irq_workfn(struct irq_work *irq_work)
@@ -4038,7 +4065,7 @@ static void free_dsq_irq_workfn(struct irq_work *irq_work)
 	struct scx_dispatch_q *dsq, *tmp_dsq;
 
 	llist_for_each_entry_safe(dsq, tmp_dsq, to_free, free_node)
-		kfree_rcu(dsq, rcu);
+		call_rcu(&dsq->rcu, free_dsq_rcufn);
 }
 
 static DEFINE_IRQ_WORK(free_dsq_irq_work, free_dsq_irq_workfn);
@@ -4235,15 +4262,17 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 		cgroup_put(sch_cgroup(sch));
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
-	/*
-	 * $sch would have entered bypass mode before the RCU grace period. As
-	 * that blocks new deferrals, all deferred_reenq_local_node's must be
-	 * off-list by now.
-	 */
 	for_each_possible_cpu(cpu) {
 		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
 
+		/*
+		 * $sch would have entered bypass mode before the RCU grace
+		 * period. As that blocks new deferrals, all
+		 * deferred_reenq_local_node's must be off-list by now.
+		 */
 		WARN_ON_ONCE(!list_empty(&pcpu->deferred_reenq_local.node));
+
+		exit_dsq(bypass_dsq(sch, cpu));
 	}
 
 	free_percpu(sch->pcpu);
@@ -5788,6 +5817,9 @@ static int alloc_kick_syncs(void)
 
 static void free_pnode(struct scx_sched_pnode *pnode)
 {
+	if (!pnode)
+		return;
+	exit_dsq(&pnode->global_dsq);
 	kfree(pnode);
 }
 
@@ -5799,7 +5831,10 @@ static struct scx_sched_pnode *alloc_pnode(struct scx_sched *sch, int node)
 	if (!pnode)
 		return NULL;
 
-	init_dsq(&pnode->global_dsq, SCX_DSQ_GLOBAL, sch);
+	if (init_dsq(&pnode->global_dsq, SCX_DSQ_GLOBAL, sch)) {
+		kfree(pnode);
+		return NULL;
+	}
 
 	return pnode;
 }
@@ -5849,8 +5884,11 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 		goto err_free_pnode;
 	}
 
-	for_each_possible_cpu(cpu)
-		init_dsq(bypass_dsq(sch, cpu), SCX_DSQ_BYPASS, sch);
+	for_each_possible_cpu(cpu) {
+		ret = init_dsq(bypass_dsq(sch, cpu), SCX_DSQ_BYPASS, sch);
+		if (ret)
+			goto err_free_pcpu;
+	}
 
 	for_each_possible_cpu(cpu) {
 		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
@@ -5932,6 +5970,10 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 err_stop_helper:
 	kthread_destroy_worker(sch->helper);
 err_free_pcpu:
+	for_each_possible_cpu(cpu) {
+		if (bypass_dsq(sch, cpu))
+			exit_dsq(bypass_dsq(sch, cpu));
+	}
 	free_percpu(sch->pcpu);
 err_free_pnode:
 	for_each_node_state(node, N_POSSIBLE)
@@ -7174,7 +7216,7 @@ void __init init_sched_ext_class(void)
 		int  n = cpu_to_node(cpu);
 
 		/* local_dsq's sch will be set during scx_root_enable() */
-		init_dsq(&rq->scx.local_dsq, SCX_DSQ_LOCAL, NULL);
+		BUG_ON(init_dsq(&rq->scx.local_dsq, SCX_DSQ_LOCAL, NULL));
 
 		INIT_LIST_HEAD(&rq->scx.runnable_list);
 		INIT_LIST_HEAD(&rq->scx.ddsp_deferred_locals);
@@ -7873,11 +7915,21 @@ __bpf_kfunc s32 scx_bpf_create_dsq(u64 dsq_id, s32 node, const struct bpf_prog_a
 	if (!dsq)
 		return -ENOMEM;
 
+	/*
+	 * init_dsq() must be called in GFP_KERNEL context. Init it with NULL
+	 * @sch and update afterwards.
+	 */
+	ret = init_dsq(dsq, dsq_id, NULL);
+	if (ret) {
+		kfree(dsq);
+		return ret;
+	}
+
 	rcu_read_lock();
 
 	sch = scx_prog_sched(aux);
 	if (sch) {
-		init_dsq(dsq, dsq_id, sch);
+		dsq->sched = sch;
 		ret = rhashtable_lookup_insert_fast(&sch->dsq_hash, &dsq->hash_node,
 						    dsq_hash_params);
 	} else {
@@ -7885,8 +7937,10 @@ __bpf_kfunc s32 scx_bpf_create_dsq(u64 dsq_id, s32 node, const struct bpf_prog_a
 	}
 
 	rcu_read_unlock();
-	if (ret)
+	if (ret) {
+		exit_dsq(dsq);
 		kfree(dsq);
+	}
 	return ret;
 }
 
