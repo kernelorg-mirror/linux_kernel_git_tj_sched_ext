@@ -125,6 +125,7 @@ enum scx_ent_flags {
 	 *
 	 * NONE		not being reenqueued
 	 * KFUNC	reenqueued by scx_bpf_dsq_reenq() and friends
+	 * IMMED	reenqueued due to failed ENQ_IMMED
 	 */
 	SCX_TASK_REENQ_REASON_SHIFT = 12,
 	SCX_TASK_REENQ_REASON_BITS = 2,
@@ -132,6 +133,7 @@ enum scx_ent_flags {
 
 	SCX_TASK_REENQ_NONE	= 0 << SCX_TASK_REENQ_REASON_SHIFT,
 	SCX_TASK_REENQ_KFUNC	= 1 << SCX_TASK_REENQ_REASON_SHIFT,
+	SCX_TASK_REENQ_IMMED	= 2 << SCX_TASK_REENQ_REASON_SHIFT,
 
 	/* iteration cursor, not a task */
 	SCX_TASK_CURSOR		= 1 << 31,
@@ -140,6 +142,7 @@ enum scx_ent_flags {
 /* scx_entity.dsq_flags */
 enum scx_ent_dsq_flags {
 	SCX_TASK_DSQ_ON_PRIQ	= 1 << 0, /* task is queued on the priority queue of a dsq */
+	SCX_TASK_DSQ_IMMED	= 1 << 1, /* task is queued with %SCX_ENQ_IMMED */
 };
 
 /*

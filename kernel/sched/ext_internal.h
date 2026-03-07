@@ -31,6 +31,8 @@ enum scx_consts {
 	SCX_BYPASS_LB_MIN_DELTA_DIV	= 4,
 	SCX_BYPASS_LB_BATCH		= 256,
 
+	SCX_REENQ_LOCAL_MAX_REPEAT	= 256,
+
 	SCX_SUB_MAX_DEPTH		= 4,
 };
 
@@ -894,6 +896,24 @@ struct scx_event_stats {
 	s64		SCX_EV_ENQ_SKIP_MIGRATION_DISABLED;
 
 	/*
+	 * The number of times a task, enqueued on a local DSQ with
+	 * SCX_ENQ_IMMED, was re-enqueued because the CPU was not available for
+	 * immediate execution.
+	 */
+	s64		SCX_EV_REENQ_IMMED;
+
+	/*
+	 * The number of times a reenq of local DSQ caused another reenq of
+	 * local DSQ. This can happen when %SCX_ENQ_IMMED races against a higher
+	 * priority class task even if the BPF scheduler always satisfies the
+	 * prerequisites for %SCX_ENQ_IMMED at the time of enqueue. However,
+	 * that scenario is very unlikely and this count going up regularly
+	 * indicates that the BPF scheduler is handling %SCX_ENQ_REENQ
+	 * incorrectly causing recursive reenqueues.
+	 */
+	s64		SCX_EV_REENQ_LOCAL_REPEAT;
+
+	/*
 	 * Total number of times a task's time slice was refilled with the
 	 * default value (SCX_SLICE_DFL).
 	 */
@@ -957,6 +977,8 @@ struct scx_dsp_ctx {
 struct scx_deferred_reenq_local {
 	struct list_head	node;
 	u64			flags;
+	u64			seq;
+	u32			cnt;
 };
 
 struct scx_sched_pcpu {
@@ -1080,6 +1102,13 @@ enum scx_enq_flags {
 	SCX_ENQ_PREEMPT		= 1LLU << 32,
 
 	/*
+	 * Only allowed on local DSQs. Enqueue succeeds iff the task can go on
+	 * the CPU immediately. Otherwise, the task is re-enqueued with
+	 * %SCX_TASK_REENQ_IMMED.
+	 */
+	SCX_ENQ_IMMED		= 1LLU << 33,
+
+	/*
 	 * The task being enqueued was previously enqueued on a DSQ, but was
 	 * removed and is being re-enqueued. See SCX_TASK_REENQ_* flags to find
 	 * out why a given task is being reenqueued.
@@ -1103,6 +1132,7 @@ enum scx_enq_flags {
 	SCX_ENQ_CLEAR_OPSS	= 1LLU << 56,
 	SCX_ENQ_DSQ_PRIQ	= 1LLU << 57,
 	SCX_ENQ_NESTED		= 1LLU << 58,
+	SCX_ENQ_GDSQ_FALLBACK	= 1LLU << 59,	/* fell back to global DSQ */
 };
 
 enum scx_deq_flags {
@@ -1132,6 +1162,12 @@ enum scx_reenq_flags {
 	__SCX_REENQ_FILTER_MASK	= 0xffffLLU,
 
 	__SCX_REENQ_USER_MASK	= SCX_REENQ_ANY,
+
+	/* bits 32-35 used by task_should_reenq() */
+	SCX_REENQ_TSR_CURR_DONE	= 1LLU << 32,
+	SCX_REENQ_TSR_NOT_FIRST	= 1LLU << 33,
+
+	__SCX_REENQ_TSR_MASK	= 0xfLLU << 32,
 };
 
 enum scx_pick_idle_cpu_flags {

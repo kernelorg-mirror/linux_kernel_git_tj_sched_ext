@@ -404,6 +404,38 @@ static bool bypass_dsp_enabled(struct scx_sched *sch)
 	return unlikely(atomic_read(&sch->bypass_dsp_enable_depth));
 }
 
+/**
+ * is_curr_done - Is the current task of a runqueue done with the CPU?
+ * @rq: rq to test
+ */
+static bool is_curr_done(struct rq *rq)
+{
+	struct task_struct *curr = rq->curr;
+
+	lockdep_assert_rq_held(rq);
+
+	/* if idle, yes */
+	if (is_idle_task(curr))
+		return true;
+
+	/*
+	 * If we're in the dispatch path holding rq lock, $curr, whether in
+	 * sched_ext or a higher-priority class, is ready to give up the CPU.
+	 */
+	if (rq->scx.flags & SCX_RQ_IN_BALANCE)
+		return true;
+
+	/*
+	 * If $curr is an SCX task, 0 slice indicates that a scheduling event is
+	 * imminent. This allows e.g. %SCX_ENQ_PREEMPT and %SCX_ENQ_IMMED to
+	 * see @rq as open as soon as it clears the current task's slice.
+	 */
+	if (curr->sched_class == &ext_sched_class && !curr->scx.slice)
+		return true;
+
+	return false;
+}
+
 /*
  * scx_kf_mask enforcement. Some kfuncs can only be called from specific SCX
  * ops. When invoking SCX ops, SCX_CALL_OP[_RET]() should be used to indicate
@@ -1218,6 +1250,16 @@ static void schedule_dsq_reenq(struct scx_sched *sch, struct scx_dispatch_q *dsq
 	}
 }
 
+static void schedule_root_reenq(struct rq *rq, u64 reenq_flags)
+{
+	struct scx_sched *root = rcu_dereference_sched(scx_root);
+
+	if (WARN_ON_ONCE(!root))
+		return;
+
+	schedule_dsq_reenq(root, &rq->scx.local_dsq, reenq_flags);
+}
+
 /**
  * touch_core_sched - Update timestamp used for core-sched task ordering
  * @rq: rq to read clock from, must be locked
@@ -1294,14 +1336,53 @@ static bool scx_dsq_priq_less(struct rb_node *node_a,
 	return time_before64(a->scx.dsq_vtime, b->scx.dsq_vtime);
 }
 
-static void dsq_mod_nr(struct scx_dispatch_q *dsq, s32 delta)
+static void dsq_inc_nr(struct scx_dispatch_q *dsq, struct task_struct *p, u64 enq_flags)
 {
 	/*
 	 * scx_bpf_dsq_nr_queued() reads ->nr without locking. Use READ_ONCE()
 	 * on the read side and WRITE_ONCE() on the write side to properly
 	 * annotate the concurrent lockless access and avoid KCSAN warnings.
 	 */
-	WRITE_ONCE(dsq->nr, READ_ONCE(dsq->nr) + delta);
+	WRITE_ONCE(dsq->nr, READ_ONCE(dsq->nr) + 1);
+
+	if (enq_flags & SCX_ENQ_IMMED) {
+		struct rq *rq;
+
+		if (unlikely(dsq->id != SCX_DSQ_LOCAL)) {
+			WARN_ON_ONCE(!(enq_flags & SCX_ENQ_GDSQ_FALLBACK));
+			return;
+		}
+		rq = container_of(dsq, struct rq, scx.local_dsq);
+
+		p->scx.dsq_flags |= SCX_TASK_DSQ_IMMED;
+		rq->scx.nr_immed++;
+
+		/*
+		 * If @rq already had other tasks or the current task is not
+		 * done yet, @p can't go on the CPU immediately. Re-enqueue.
+		 */
+		if (unlikely(dsq->nr > 1 || !is_curr_done(rq)))
+			schedule_root_reenq(rq, 0);
+	}
+}
+
+static void dsq_dec_nr(struct scx_dispatch_q *dsq, struct task_struct *p)
+{
+	/* see dsq_inc_nr() */
+	WRITE_ONCE(dsq->nr, READ_ONCE(dsq->nr) - 1);
+
+	if (p->scx.dsq_flags & SCX_TASK_DSQ_IMMED) {
+		struct rq *rq;
+
+		p->scx.dsq_flags &= ~SCX_TASK_DSQ_IMMED;
+
+		if (WARN_ON_ONCE(dsq->id != SCX_DSQ_LOCAL))
+			return;
+		rq = container_of(dsq, struct rq, scx.local_dsq);
+
+		WARN_ON_ONCE(rq->scx.nr_immed == 0);
+		rq->scx.nr_immed--;
+	}
 }
 
 static void refill_task_slice_dfl(struct scx_sched *sch, struct task_struct *p)
@@ -1460,7 +1541,7 @@ static void dispatch_enqueue(struct scx_sched *sch, struct rq *rq,
 	WRITE_ONCE(dsq->seq, dsq->seq + 1);
 	p->scx.dsq_seq = dsq->seq;
 
-	dsq_mod_nr(dsq, 1);
+	dsq_inc_nr(dsq, p, enq_flags);
 	p->scx.dsq = dsq;
 
 	/*
@@ -1514,7 +1595,7 @@ static void task_unlink_from_dsq(struct task_struct *p,
 	}
 
 	list_del_init(&p->scx.dsq_list.node);
-	dsq_mod_nr(dsq, -1);
+	dsq_dec_nr(dsq, p);
 
 	if (!(dsq->id & SCX_DSQ_FLAG_BUILTIN) && dsq->first_task == p) {
 		struct task_struct *first_task;
@@ -2052,7 +2133,7 @@ static void move_local_task_to_local_dsq(struct task_struct *p, u64 enq_flags,
 	else
 		list_add_tail(&p->scx.dsq_list.node, &dst_dsq->list);
 
-	dsq_mod_nr(dst_dsq, 1);
+	dsq_inc_nr(dst_dsq, p, enq_flags);
 	p->scx.dsq = dst_dsq;
 
 	local_dsq_post_enq(dst_dsq, p, enq_flags);
@@ -2260,6 +2341,7 @@ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
 		    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
 			dst_dsq = find_global_dsq(sch, task_cpu(p));
 			dst_rq = src_rq;
+			enq_flags |= SCX_ENQ_GDSQ_FALLBACK;
 		}
 	} else {
 		/* no need to migrate if destination is a non-local DSQ */
@@ -2388,7 +2470,7 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
 	if (src_rq != dst_rq &&
 	    unlikely(!task_can_run_on_remote_rq(sch, p, dst_rq, true))) {
 		dispatch_enqueue(sch, rq, find_global_dsq(sch, task_cpu(p)), p,
-				 enq_flags | SCX_ENQ_CLEAR_OPSS);
+				 enq_flags | SCX_ENQ_CLEAR_OPSS | SCX_ENQ_GDSQ_FALLBACK);
 		return;
 	}
 
@@ -2741,6 +2823,14 @@ static int balance_one(struct rq *rq, struct task_struct *prev)
 	return false;
 
 has_tasks:
+	/*
+	 * @rq may still have an IMMED task without reenq scheduled if e.g. a
+	 * non-IMMED HEAD task gets queued in front of an IMMED task between the
+	 * IMMED queueing and the subsequent scheduling event.
+	 */
+	if (unlikely(rq->scx.nr_immed))
+		schedule_root_reenq(rq, 0);
+
 	rq->scx.flags &= ~SCX_RQ_IN_BALANCE;
 	return true;
 }
@@ -3729,12 +3819,25 @@ int scx_check_setscheduler(struct task_struct *p, int policy)
 	return 0;
 }
 
-static bool task_should_reenq(struct task_struct *p, u64 reenq_flags, u32 *reason)
+static bool task_should_reenq(struct task_struct *p, u64 *reenq_flags, u32 *reason)
 {
+	bool first;
+
+	first = !(*reenq_flags & SCX_REENQ_TSR_NOT_FIRST);
+	*reenq_flags |= SCX_REENQ_TSR_NOT_FIRST;
+
 	*reason = SCX_TASK_REENQ_KFUNC;
 
-	if (reenq_flags & SCX_REENQ_ANY)
+	if ((p->scx.dsq_flags & SCX_TASK_DSQ_IMMED) &&
+	    (!first || !(*reenq_flags & SCX_REENQ_TSR_CURR_DONE))) {
+		__scx_add_event(scx_task_sched(p), SCX_EV_REENQ_IMMED, 1);
+		*reason = SCX_TASK_REENQ_IMMED;
 		return true;
+	}
+
+	if (*reenq_flags & SCX_REENQ_ANY)
+		return true;
+
 	return false;
 }
 
@@ -3745,6 +3848,11 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq, u64 reenq_flags)
 	struct task_struct *p, *n;
 
 	lockdep_assert_rq_held(rq);
+
+	if (WARN_ON_ONCE(reenq_flags & __SCX_REENQ_TSR_MASK))
+		reenq_flags &= ~__SCX_REENQ_TSR_MASK;
+	if (is_curr_done(rq))
+		reenq_flags |= SCX_REENQ_TSR_CURR_DONE;
 
 	/*
 	 * The BPF scheduler may choose to dispatch tasks back to
@@ -3773,7 +3881,7 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq, u64 reenq_flags)
 		if (!scx_is_descendant(task_sch, sch))
 			continue;
 
-		if (!task_should_reenq(p, reenq_flags, &reason))
+		if (!task_should_reenq(p, &reenq_flags, &reason))
 			continue;
 
 		dispatch_dequeue(rq, p);
@@ -3799,11 +3907,14 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq, u64 reenq_flags)
 
 static void process_deferred_reenq_locals(struct rq *rq)
 {
+	u32 seq = rq->scx.deferred_reenq_locals_seq++;
+
 	lockdep_assert_rq_held(rq);
 
 	while (true) {
 		struct scx_sched *sch;
 		u64 reenq_flags;
+		bool skip = false;
 
 		scoped_guard (raw_spinlock, &rq->scx.deferred_reenq_lock) {
 			struct scx_deferred_reenq_local *drl =
@@ -3818,15 +3929,31 @@ static void process_deferred_reenq_locals(struct rq *rq)
 			sch_pcpu = container_of(drl, struct scx_sched_pcpu,
 						deferred_reenq_local);
 			sch = sch_pcpu->sch;
+
 			reenq_flags = drl->flags;
 			WRITE_ONCE(drl->flags, 0);
 			list_del_init(&drl->node);
+
+			if (likely(drl->seq != seq)) {
+				drl->seq = seq;
+				drl->cnt = 0;
+			} else {
+				if (unlikely(++drl->cnt > SCX_REENQ_LOCAL_MAX_REPEAT)) {
+					scx_error(sch, "SCX_ENQ_REENQ on SCX_DSQ_LOCAL repeated %u times",
+						  drl->cnt);
+					skip = true;
+				}
+
+				__scx_add_event(sch, SCX_EV_REENQ_LOCAL_REPEAT, 1);
+			}
 		}
 
-		/* see schedule_dsq_reenq() */
-		smp_mb();
+		if (!skip) {
+			/* see schedule_dsq_reenq() */
+			smp_mb();
 
-		reenq_local(sch, rq, reenq_flags);
+			reenq_local(sch, rq, reenq_flags);
+		}
 	}
 }
 
@@ -3840,6 +3967,9 @@ static void reenq_user(struct rq *rq, struct scx_dispatch_q *dsq, u64 reenq_flag
 
 	lockdep_assert_rq_held(rq);
 
+	if (WARN_ON_ONCE(reenq_flags & __SCX_REENQ_TSR_MASK))
+		reenq_flags &= ~__SCX_REENQ_TSR_MASK;
+
 	raw_spin_lock(&dsq->lock);
 
 	while (likely(!READ_ONCE(sch->bypass_depth))) {
@@ -3850,7 +3980,7 @@ static void reenq_user(struct rq *rq, struct scx_dispatch_q *dsq, u64 reenq_flag
 		if (!p)
 			break;
 
-		if (!task_should_reenq(p, reenq_flags, &reason))
+		if (!task_should_reenq(p, &reenq_flags, &reason))
 			continue;
 
 		task_rq = task_rq(p);
@@ -4581,6 +4711,8 @@ static ssize_t scx_attr_events_show(struct kobject *kobj,
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_DISPATCH_KEEP_LAST);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_ENQ_SKIP_EXITING);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_ENQ_SKIP_MIGRATION_DISABLED);
+	at += scx_attr_event_show(buf, at, &events, SCX_EV_REENQ_IMMED);
+	at += scx_attr_event_show(buf, at, &events, SCX_EV_REENQ_LOCAL_REPEAT);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_REFILL_SLICE_DFL);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_DURATION);
 	at += scx_attr_event_show(buf, at, &events, SCX_EV_BYPASS_DISPATCH);
@@ -5987,6 +6119,8 @@ static void scx_dump_state(struct scx_sched *sch, struct scx_exit_info *ei,
 	scx_dump_event(s, &events, SCX_EV_DISPATCH_KEEP_LAST);
 	scx_dump_event(s, &events, SCX_EV_ENQ_SKIP_EXITING);
 	scx_dump_event(s, &events, SCX_EV_ENQ_SKIP_MIGRATION_DISABLED);
+	scx_dump_event(s, &events, SCX_EV_REENQ_IMMED);
+	scx_dump_event(s, &events, SCX_EV_REENQ_LOCAL_REPEAT);
 	scx_dump_event(s, &events, SCX_EV_REFILL_SLICE_DFL);
 	scx_dump_event(s, &events, SCX_EV_BYPASS_DURATION);
 	scx_dump_event(s, &events, SCX_EV_BYPASS_DISPATCH);
@@ -7499,8 +7633,20 @@ void __init init_sched_ext_class(void)
 /********************************************************************************
  * Helpers that can be called from the BPF scheduler.
  */
+static bool scx_vet_enq_flags(struct scx_sched *sch, u64 dsq_id, u64 enq_flags)
+{
+	if ((enq_flags & SCX_ENQ_IMMED) &&
+	    unlikely(dsq_id != SCX_DSQ_LOCAL &&
+		     (dsq_id & SCX_DSQ_LOCAL_ON) != SCX_DSQ_LOCAL_ON)) {
+		scx_error(sch, "SCX_ENQ_IMMED on a non-local DSQ 0x%llx", dsq_id);
+		return false;
+	}
+
+	return true;
+}
+
 static bool scx_dsq_insert_preamble(struct scx_sched *sch, struct task_struct *p,
-				    u64 enq_flags)
+				    u64 dsq_id, u64 enq_flags)
 {
 	if (!scx_kf_allowed(sch, SCX_KF_ENQUEUE | SCX_KF_DISPATCH))
 		return false;
@@ -7522,6 +7668,9 @@ static bool scx_dsq_insert_preamble(struct scx_sched *sch, struct task_struct *p
 		__scx_add_event(sch, SCX_EV_INSERT_NOT_OWNED, 1);
 		return false;
 	}
+
+	if (!scx_vet_enq_flags(sch, dsq_id, enq_flags))
+		return false;
 
 	return true;
 }
@@ -7604,7 +7753,7 @@ __bpf_kfunc bool scx_bpf_dsq_insert___v2(struct task_struct *p, u64 dsq_id,
 	if (unlikely(!sch))
 		return false;
 
-	if (!scx_dsq_insert_preamble(sch, p, enq_flags))
+	if (!scx_dsq_insert_preamble(sch, p, dsq_id, enq_flags))
 		return false;
 
 	if (slice)
@@ -7630,7 +7779,7 @@ __bpf_kfunc void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id,
 static bool scx_dsq_insert_vtime(struct scx_sched *sch, struct task_struct *p,
 				 u64 dsq_id, u64 slice, u64 vtime, u64 enq_flags)
 {
-	if (!scx_dsq_insert_preamble(sch, p, enq_flags))
+	if (!scx_dsq_insert_preamble(sch, p, dsq_id, enq_flags))
 		return false;
 
 	if (slice)
@@ -7755,6 +7904,9 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
 
 	if (!scx_kf_allowed_if_unlocked() &&
 	    !scx_kf_allowed(sch, SCX_KF_DISPATCH))
+		return false;
+
+	if (!scx_vet_enq_flags(sch, dsq_id, enq_flags))
 		return false;
 
 	/*
@@ -9070,6 +9222,8 @@ static void scx_read_events(struct scx_sched *sch, struct scx_event_stats *event
 		scx_agg_event(events, e_cpu, SCX_EV_DISPATCH_KEEP_LAST);
 		scx_agg_event(events, e_cpu, SCX_EV_ENQ_SKIP_EXITING);
 		scx_agg_event(events, e_cpu, SCX_EV_ENQ_SKIP_MIGRATION_DISABLED);
+		scx_agg_event(events, e_cpu, SCX_EV_REENQ_IMMED);
+		scx_agg_event(events, e_cpu, SCX_EV_REENQ_LOCAL_REPEAT);
 		scx_agg_event(events, e_cpu, SCX_EV_REFILL_SLICE_DFL);
 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_DURATION);
 		scx_agg_event(events, e_cpu, SCX_EV_BYPASS_DISPATCH);
