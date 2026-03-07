@@ -8210,11 +8210,17 @@ __bpf_kfunc_start_defs();
 /**
  * scx_bpf_task_set_slice - Set task's time slice
  * @p: task of interest
- * @slice: time slice to set in nsecs
+ * @slice: non-zero time slice to set in nsecs
  * @aux: implicit BPF argument to access bpf_prog_aux hidden from BPF progs
  *
  * Set @p's time slice to @slice. Returns %true on success, %false if the
  * calling scheduler doesn't have authority over @p.
+ *
+ * @slice cannot be zero to ensure that 0 slice reliably indicates that the task
+ * has expired and is soon to go through scheduling. To clear the slice of a
+ * running task and trigger preemption, use scx_bpf_kick_cpu() with
+ * %SCX_KICK_PREEMPT. To force slice expiration on the next tick, use 1 which is
+ * practically guaranteed to expire on the following tick.
  */
 __bpf_kfunc bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice,
 					const struct bpf_prog_aux *aux)
@@ -8225,6 +8231,11 @@ __bpf_kfunc bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice,
 	sch = scx_prog_sched(aux);
 	if (unlikely(!scx_task_on_sched(sch, p)))
 		return false;
+
+	if (unlikely(!slice)) {
+		scx_error(sch, "scx_bpf_task_set_slice() called with 0 slice, use SCX_KICK_PREEMPT instead");
+		return false;
+	}
 
 	p->scx.slice = slice;
 	return true;
