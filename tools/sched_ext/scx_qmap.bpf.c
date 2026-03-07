@@ -47,6 +47,7 @@ const volatile bool print_msgs;
 const volatile u64 sub_cgroup_id;
 const volatile s32 disallow_tgid;
 const volatile bool suppress_dump;
+const volatile bool always_enq_immed;
 
 u64 nr_highpri_queued;
 u32 test_error_cnt;
@@ -144,8 +145,10 @@ static s32 pick_direct_dispatch_cpu(struct task_struct *p, s32 prev_cpu)
 {
 	s32 cpu;
 
-	if (p->nr_cpus_allowed == 1 ||
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+	if (!always_enq_immed && p->nr_cpus_allowed == 1)
+		return prev_cpu;
+
+	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 		return prev_cpu;
 
 	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);

@@ -7633,20 +7633,25 @@ void __init init_sched_ext_class(void)
 /********************************************************************************
  * Helpers that can be called from the BPF scheduler.
  */
-static bool scx_vet_enq_flags(struct scx_sched *sch, u64 dsq_id, u64 enq_flags)
+static bool scx_vet_enq_flags(struct scx_sched *sch, u64 dsq_id, u64 *enq_flags)
 {
-	if ((enq_flags & SCX_ENQ_IMMED) &&
-	    unlikely(dsq_id != SCX_DSQ_LOCAL &&
-		     (dsq_id & SCX_DSQ_LOCAL_ON) != SCX_DSQ_LOCAL_ON)) {
-		scx_error(sch, "SCX_ENQ_IMMED on a non-local DSQ 0x%llx", dsq_id);
-		return false;
+	bool is_local = dsq_id == SCX_DSQ_LOCAL ||
+		(dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON;
+
+	if (*enq_flags & SCX_ENQ_IMMED) {
+		if (unlikely(!is_local)) {
+			scx_error(sch, "SCX_ENQ_IMMED on a non-local DSQ 0x%llx", dsq_id);
+			return false;
+		}
+	} else if ((sch->ops.flags & SCX_OPS_ALWAYS_ENQ_IMMED) && is_local) {
+		*enq_flags |= SCX_ENQ_IMMED;
 	}
 
 	return true;
 }
 
 static bool scx_dsq_insert_preamble(struct scx_sched *sch, struct task_struct *p,
-				    u64 dsq_id, u64 enq_flags)
+				    u64 dsq_id, u64 *enq_flags)
 {
 	if (!scx_kf_allowed(sch, SCX_KF_ENQUEUE | SCX_KF_DISPATCH))
 		return false;
@@ -7658,8 +7663,8 @@ static bool scx_dsq_insert_preamble(struct scx_sched *sch, struct task_struct *p
 		return false;
 	}
 
-	if (unlikely(enq_flags & __SCX_ENQ_INTERNAL_MASK)) {
-		scx_error(sch, "invalid enq_flags 0x%llx", enq_flags);
+	if (unlikely(*enq_flags & __SCX_ENQ_INTERNAL_MASK)) {
+		scx_error(sch, "invalid enq_flags 0x%llx", *enq_flags);
 		return false;
 	}
 
@@ -7753,7 +7758,7 @@ __bpf_kfunc bool scx_bpf_dsq_insert___v2(struct task_struct *p, u64 dsq_id,
 	if (unlikely(!sch))
 		return false;
 
-	if (!scx_dsq_insert_preamble(sch, p, dsq_id, enq_flags))
+	if (!scx_dsq_insert_preamble(sch, p, dsq_id, &enq_flags))
 		return false;
 
 	if (slice)
@@ -7779,7 +7784,7 @@ __bpf_kfunc void scx_bpf_dsq_insert(struct task_struct *p, u64 dsq_id,
 static bool scx_dsq_insert_vtime(struct scx_sched *sch, struct task_struct *p,
 				 u64 dsq_id, u64 slice, u64 vtime, u64 enq_flags)
 {
-	if (!scx_dsq_insert_preamble(sch, p, dsq_id, enq_flags))
+	if (!scx_dsq_insert_preamble(sch, p, dsq_id, &enq_flags))
 		return false;
 
 	if (slice)
@@ -7906,7 +7911,7 @@ static bool scx_dsq_move(struct bpf_iter_scx_dsq_kern *kit,
 	    !scx_kf_allowed(sch, SCX_KF_DISPATCH))
 		return false;
 
-	if (!scx_vet_enq_flags(sch, dsq_id, enq_flags))
+	if (!scx_vet_enq_flags(sch, dsq_id, &enq_flags))
 		return false;
 
 	/*
