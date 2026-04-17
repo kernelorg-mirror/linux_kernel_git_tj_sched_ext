@@ -197,11 +197,14 @@ static inline bool rht_shrink_below_30(const struct rhashtable *ht,
  * rht_grow_above_100 - returns true if nelems > table-size
  * @ht:		hash table
  * @tbl:	current table
+ *
+ * Returns false if the caller opted out of synchronous grow.
  */
 static inline bool rht_grow_above_100(const struct rhashtable *ht,
 				      const struct bucket_table *tbl)
 {
-	return atomic_read(&ht->nelems) > tbl->size &&
+	return !ht->p.no_sync_grow &&
+		atomic_read(&ht->nelems) > tbl->size &&
 		(!ht->p.max_size || tbl->size < ht->p.max_size);
 }
 

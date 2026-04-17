@@ -50,6 +50,7 @@ typedef int (*rht_obj_cmpfn_t)(struct rhashtable_compare_arg *arg,
  * @max_size: Maximum size while expanding
  * @min_size: Minimum size while shrinking
  * @automatic_shrinking: Enable automatic shrinking of tables
+ * @no_sync_grow: Skip sync grow on insert (allows inserts under raw_spinlock_t)
  * @hashfn: Hash function (default: jhash2 if !(key_len % 4), or jhash)
  * @obj_hashfn: Function to hash object
  * @obj_cmpfn: Function to compare key with object
@@ -62,6 +63,7 @@ struct rhashtable_params {
 	unsigned int		max_size;
 	u16			min_size;
 	bool			automatic_shrinking;
+	bool			no_sync_grow;
 	rht_hashfn_t		hashfn;
 	rht_obj_hashfn_t	obj_hashfn;
 	rht_obj_cmpfn_t		obj_cmpfn;
