@@ -32,6 +32,7 @@ static const struct rhashtable_params scx_sched_hash_params = {
 	.key_len		= sizeof_field(struct scx_sched, ops.sub_cgroup_id),
 	.key_offset		= offsetof(struct scx_sched, ops.sub_cgroup_id),
 	.head_offset		= offsetof(struct scx_sched, hash_node),
+	.no_sync_grow		= true,	/* inserted under scx_sched_lock */
 };
 
 static struct rhashtable scx_sched_hash;
@@ -122,6 +123,7 @@ static const struct rhashtable_params dsq_hash_params = {
 	.key_len		= sizeof_field(struct scx_dispatch_q, id),
 	.key_offset		= offsetof(struct scx_dispatch_q, id),
 	.head_offset		= offsetof(struct scx_dispatch_q, hash_node),
+	.no_sync_grow		= true,	/* removed under dsq->lock */
 };
 
 static LLIST_HEAD(dsqs_to_free);
