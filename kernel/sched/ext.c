@@ -7,6 +7,7 @@
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
 #include <linux/btf_ids.h>
+#include "ext_cid.h"
 #include "ext_idle.h"
 
 static DEFINE_RAW_SPINLOCK(scx_sched_lock);
@@ -6727,6 +6728,16 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	cpus_read_lock();
 
 	/*
+	 * Build the cid mapping before publishing scx_root. The cid kfuncs
+	 * dereference the cid arrays unconditionally once scx_prog_sched()
+	 * returns non-NULL; the rcu_assign_pointer() below pairs with their
+	 * rcu_dereference() to make the populated arrays visible.
+	 */
+	ret = scx_cid_init(sch);
+	if (ret)
+		goto err_disable;
+
+	/*
 	 * Make the scheduler instance visible. Must be inside cpus_read_lock().
 	 * See handle_hotplug().
 	 */
@@ -9771,6 +9782,12 @@ static int __init scx_init(void)
 	ret = scx_idle_init();
 	if (ret) {
 		pr_err("sched_ext: Failed to initialize idle tracking (%d)\n", ret);
+		return ret;
+	}
+
+	ret = scx_cid_kfunc_init();
+	if (ret) {
+		pr_err("sched_ext: Failed to register cid kfuncs (%d)\n", ret);
 		return ret;
 	}
 
