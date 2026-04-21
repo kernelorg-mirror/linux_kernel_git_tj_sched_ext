@@ -9,6 +9,14 @@
 
 #include "ext_cid.h"
 
+/*
+ * Per-cpu scratch cmask used by scx_call_op_set_cpumask() to synthesize a
+ * cmask from a cpumask. Allocated alongside the cid arrays on first enable
+ * and never freed. Sized to the full cid space. Caller holds rq lock so
+ * this_cpu_ptr is safe.
+ */
+static struct scx_cmask __percpu *scx_set_cmask_scratch;
+
 s16 *scx_cid_to_cpu_tbl;
 s16 *scx_cpu_to_cid_tbl;
 struct scx_cid_topo *scx_cid_topo;
@@ -44,8 +52,11 @@ static const struct cpumask *cpu_llc_mask(int cpu, struct cpumask *fallbacks)
 static s32 scx_cid_arrays_alloc(void)
 {
 	u32 npossible = num_possible_cpus();
+	size_t scratch_total = sizeof(struct scx_cmask) +
+		SCX_CMASK_NR_WORDS(npossible) * sizeof(u64);
 	s16 *cid_to_cpu, *cpu_to_cid;
 	struct scx_cid_topo *cid_topo;
+	struct scx_cmask __percpu *set_cmask_scratch;
 
 	if (scx_cid_to_cpu_tbl)
 		return 0;
@@ -53,17 +64,20 @@ static s32 scx_cid_arrays_alloc(void)
 	cid_to_cpu = kcalloc(npossible, sizeof(*scx_cid_to_cpu_tbl), GFP_KERNEL);
 	cpu_to_cid = kcalloc(nr_cpu_ids, sizeof(*scx_cpu_to_cid_tbl), GFP_KERNEL);
 	cid_topo = kmalloc_array(npossible, sizeof(*scx_cid_topo), GFP_KERNEL);
+	set_cmask_scratch = __alloc_percpu(scratch_total, sizeof(u64));
 
-	if (!cid_to_cpu || !cpu_to_cid || !cid_topo) {
+	if (!cid_to_cpu || !cpu_to_cid || !cid_topo || !set_cmask_scratch) {
 		kfree(cid_to_cpu);
 		kfree(cpu_to_cid);
 		kfree(cid_topo);
+		free_percpu(set_cmask_scratch);
 		return -ENOMEM;
 	}
 
 	scx_cid_to_cpu_tbl = cid_to_cpu;
 	scx_cpu_to_cid_tbl = cpu_to_cid;
 	scx_cid_topo = cid_topo;
+	scx_set_cmask_scratch = set_cmask_scratch;
 	return 0;
 }
 
@@ -206,6 +220,33 @@ s32 scx_cid_init(struct scx_sched *sch)
 			cpumask_pr_args(online_no_topo));
 
 	return 0;
+}
+
+/**
+ * scx_build_cmask_from_cpumask - Build a cmask from a kernel cpumask
+ * @cpumask: source cpumask
+ *
+ * Synthesize a cmask covering the full cid space [0, num_possible_cpus())
+ * with bits set for cids whose cpu is in @cpumask. Return a pointer to the
+ * per-cpu scratch buffer, valid until the next invocation on this cpu.
+ * Caller must hold the rq lock so this_cpu_ptr() is stable.
+ */
+const struct scx_cmask *scx_build_cmask_from_cpumask(const struct cpumask *cpumask)
+{
+	struct scx_cmask *cmask;
+	s32 cpu;
+
+	lockdep_assert_irqs_disabled();
+
+	cmask = this_cpu_ptr(scx_set_cmask_scratch);
+	scx_cmask_init(cmask, 0, num_possible_cpus());
+	for_each_cpu(cpu, cpumask) {
+		s32 cid = __scx_cpu_to_cid(cpu);
+
+		if (cid >= 0)
+			__scx_cmask_set(cmask, cid);
+	}
+	return cmask;
 }
 
 __bpf_kfunc_start_defs();

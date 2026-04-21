@@ -510,6 +510,33 @@ do {										\
 		update_locked_rq(NULL);						\
 } while (0)
 
+/*
+ * Flipped on enable per sch->is_cid_type. Declared in ext_internal.h so
+ * subsystem inlines can read it.
+ */
+DEFINE_STATIC_KEY_FALSE(__scx_is_cid_type);
+
+/*
+ * scx_cpu_arg() wraps a cpu arg being handed to an SCX op. For cid-form
+ * schedulers it resolves to the matching cid; for cpu-form it passes @cpu
+ * through. scx_cpu_ret() is the inverse for a cpu/cid returned from an op
+ * (currently only ops.select_cpu); it validates the BPF-supplied cid and
+ * triggers scx_error() on @sch if invalid.
+ */
+static s32 scx_cpu_arg(s32 cpu)
+{
+	if (scx_is_cid_type())
+		return __scx_cpu_to_cid(cpu);
+	return cpu;
+}
+
+static s32 scx_cpu_ret(struct scx_sched *sch, s32 cpu_or_cid)
+{
+	if (cpu_or_cid < 0 || !scx_is_cid_type())
+		return cpu_or_cid;
+	return scx_cid_to_cpu(sch, cpu_or_cid);
+}
+
 #define SCX_CALL_OP_RET(sch, op, rq, args...)					\
 ({										\
 	__typeof__((sch)->ops.op(args)) __ret;					\
@@ -567,6 +594,39 @@ do {										\
 	current->scx.kf_tasks[1] = NULL;					\
 	__ret;									\
 })
+
+/**
+ * scx_call_op_set_cpumask - invoke ops.set_cpumask / ops_cid.set_cmask for @task
+ * @sch: scx_sched being invoked
+ * @rq: rq to update as the currently-locked rq, or NULL
+ * @task: task whose affinity is changing
+ * @cpumask: new cpumask
+ *
+ * For cid-form schedulers, translate @cpumask to a cmask via the per-cpu
+ * scratch in ext_cid.c and dispatch through the ops_cid union view. Caller
+ * must hold @rq's rq lock so this_cpu_ptr is stable across the call.
+ */
+static inline void scx_call_op_set_cpumask(struct scx_sched *sch, struct rq *rq,
+					   struct task_struct *task,
+					   const struct cpumask *cpumask)
+{
+	WARN_ON_ONCE(current->scx.kf_tasks[0]);
+	current->scx.kf_tasks[0] = task;
+	if (rq)
+		update_locked_rq(rq);
+
+	if (scx_is_cid_type()) {
+		const struct scx_cmask *cmask =
+			scx_build_cmask_from_cpumask(cpumask);
+		sch->ops_cid.set_cmask(task, cmask);
+	} else {
+		sch->ops.set_cpumask(task, cpumask);
+	}
+
+	if (rq)
+		update_locked_rq(NULL);
+	current->scx.kf_tasks[0] = NULL;
+}
 
 /* see SCX_CALL_OP_TASK() */
 static __always_inline bool scx_kf_arg_task_ok(struct scx_sched *sch,
@@ -1671,7 +1731,7 @@ static struct scx_dispatch_q *find_dsq_for_dispatch(struct scx_sched *sch,
 		return &rq->scx.local_dsq;
 
 	if ((dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
-		s32 cpu = dsq_id & SCX_DSQ_LOCAL_CPU_MASK;
+		s32 cpu = scx_cpu_ret(sch, dsq_id & SCX_DSQ_LOCAL_CPU_MASK);
 
 		if (!scx_cpu_valid(sch, cpu, "in SCX_DSQ_LOCAL_ON dispatch verdict"))
 			return find_global_dsq(sch, tcpu);
@@ -2752,11 +2812,13 @@ scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
 		dspc->nr_tasks = 0;
 
 		if (nested) {
-			SCX_CALL_OP(sch, dispatch, rq, cpu, prev_on_sch ? prev : NULL);
+			SCX_CALL_OP(sch, dispatch, rq, scx_cpu_arg(cpu),
+				    prev_on_sch ? prev : NULL);
 		} else {
 			/* stash @prev so that nested invocations can access it */
 			rq->scx.sub_dispatch_prev = prev;
-			SCX_CALL_OP(sch, dispatch, rq, cpu, prev_on_sch ? prev : NULL);
+			SCX_CALL_OP(sch, dispatch, rq, scx_cpu_arg(cpu),
+				    prev_on_sch ? prev : NULL);
 			rq->scx.sub_dispatch_prev = NULL;
 		}
 
@@ -3251,7 +3313,9 @@ static int select_task_rq_scx(struct task_struct *p, int prev_cpu, int wake_flag
 		*ddsp_taskp = p;
 
 		this_rq()->scx.in_select_cpu = true;
-		cpu = SCX_CALL_OP_TASK_RET(sch, select_cpu, NULL, p, prev_cpu, wake_flags);
+		cpu = SCX_CALL_OP_TASK_RET(sch, select_cpu, NULL, p,
+					   scx_cpu_arg(prev_cpu), wake_flags);
+		cpu = scx_cpu_ret(sch, cpu);
 		this_rq()->scx.in_select_cpu = false;
 		p->scx.selected_cpu = cpu;
 		*ddsp_taskp = NULL;
@@ -3301,7 +3365,7 @@ static void set_cpus_allowed_scx(struct task_struct *p,
 	 * designation pointless. Cast it away when calling the operation.
 	 */
 	if (SCX_HAS_OP(sch, set_cpumask))
-		SCX_CALL_OP_TASK(sch, set_cpumask, task_rq(p), p, (struct cpumask *)p->cpus_ptr);
+		scx_call_op_set_cpumask(sch, task_rq(p), p, (struct cpumask *)p->cpus_ptr);
 }
 
 static void handle_hotplug(struct rq *rq, bool online)
@@ -3323,9 +3387,9 @@ static void handle_hotplug(struct rq *rq, bool online)
 		scx_idle_update_selcpu_topology(&sch->ops);
 
 	if (online && SCX_HAS_OP(sch, cpu_online))
-		SCX_CALL_OP(sch, cpu_online, NULL, cpu);
+		SCX_CALL_OP(sch, cpu_online, NULL, scx_cpu_arg(cpu));
 	else if (!online && SCX_HAS_OP(sch, cpu_offline))
-		SCX_CALL_OP(sch, cpu_offline, NULL, cpu);
+		SCX_CALL_OP(sch, cpu_offline, NULL, scx_cpu_arg(cpu));
 	else
 		scx_exit(sch, SCX_EXIT_UNREG_KERN,
 			 SCX_ECODE_ACT_RESTART | SCX_ECODE_RSN_HOTPLUG,
@@ -3893,7 +3957,7 @@ static void switching_to_scx(struct rq *rq, struct task_struct *p)
 	 * different scheduler class. Keep the BPF scheduler up-to-date.
 	 */
 	if (SCX_HAS_OP(sch, set_cpumask))
-		SCX_CALL_OP_TASK(sch, set_cpumask, rq, p, (struct cpumask *)p->cpus_ptr);
+		scx_call_op_set_cpumask(sch, rq, p, (struct cpumask *)p->cpus_ptr);
 }
 
 static void switched_from_scx(struct rq *rq, struct task_struct *p)
@@ -5914,6 +5978,8 @@ static void scx_root_disable(struct scx_sched *sch)
 	mutex_unlock(&scx_enable_mutex);
 
 	WARN_ON_ONCE(scx_set_enable_state(SCX_DISABLED) != SCX_DISABLING);
+
+	static_branch_disable(&__scx_is_cid_type);
 done:
 	scx_bypass(sch, false);
 }
@@ -6277,8 +6343,7 @@ static void scx_dump_state(struct scx_sched *sch, struct scx_exit_info *ei,
 		used = seq_buf_used(&ns);
 		if (SCX_HAS_OP(sch, dump_cpu)) {
 			ops_dump_init(&ns, "  ");
-			SCX_CALL_OP(sch, dump_cpu, NULL,
-				    &dctx, cpu, idle);
+			SCX_CALL_OP(sch, dump_cpu, NULL, &dctx, scx_cpu_arg(cpu), idle);
 			ops_dump_exit();
 		}
 
@@ -6434,7 +6499,11 @@ static struct scx_sched_pnode *alloc_pnode(struct scx_sched *sch, int node)
  */
 struct scx_enable_cmd {
 	struct kthread_work	work;
-	struct sched_ext_ops	*ops;
+	union {
+		struct sched_ext_ops		*ops;
+		struct sched_ext_ops_cid	*ops_cid;
+	};
+	bool			is_cid_type;
 	int			ret;
 };
 
@@ -6442,10 +6511,11 @@ struct scx_enable_cmd {
  * Allocate and initialize a new scx_sched. @cgrp's reference is always
  * consumed whether the function succeeds or fails.
  */
-static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
+static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 						 struct cgroup *cgrp,
 						 struct scx_sched *parent)
 {
+	struct sched_ext_ops *ops = cmd->ops;
 	struct scx_sched *sch;
 	s32 level = parent ? parent->level + 1 : 0;
 	s32 node, cpu, ret, bypass_fail_cpu = nr_cpu_ids;
@@ -6528,7 +6598,19 @@ static struct scx_sched *scx_alloc_and_add_sched(struct sched_ext_ops *ops,
 	init_irq_work(&sch->disable_irq_work, scx_disable_irq_workfn);
 	kthread_init_work(&sch->disable_work, scx_disable_workfn);
 	timer_setup(&sch->bypass_lb_timer, scx_bypass_lb_timerfn, 0);
-	sch->ops = *ops;
+
+	/*
+	 * Copy ops through the right union view. For cid-form the source is
+	 * struct sched_ext_ops_cid which lacks the trailing cpu_acquire/
+	 * cpu_release; those stay zero from kzalloc.
+	 */
+	if (cmd->is_cid_type) {
+		sch->ops_cid = *cmd->ops_cid;
+		sch->is_cid_type = true;
+	} else {
+		sch->ops = *cmd->ops;
+	}
+
 	rcu_assign_pointer(ops->priv, sch);
 
 	sch->kobj.kset = scx_kset;
@@ -6663,7 +6745,12 @@ static int validate_ops(struct scx_sched *sch, const struct sched_ext_ops *ops)
 		return -EINVAL;
 	}
 
-	if (ops->cpu_acquire || ops->cpu_release)
+	/*
+	 * cid-form's struct is shorter and doesn't include the cpu_acquire /
+	 * cpu_release tail; reading those fields off a cid-form @ops would
+	 * run past the BPF allocation. Skip for cid-form.
+	 */
+	if (!sch->is_cid_type && (ops->cpu_acquire || ops->cpu_release))
 		pr_warn("ops->cpu_acquire/release() are deprecated, use sched_switch TP instead\n");
 
 	return 0;
@@ -6699,11 +6786,14 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 #if defined(CONFIG_EXT_GROUP_SCHED) || defined(CONFIG_EXT_SUB_SCHED)
 	cgroup_get(cgrp);
 #endif
-	sch = scx_alloc_and_add_sched(ops, cgrp, NULL);
+	sch = scx_alloc_and_add_sched(cmd, cgrp, NULL);
 	if (IS_ERR(sch)) {
 		ret = PTR_ERR(sch);
 		goto err_free_tid_hash;
 	}
+
+	if (sch->is_cid_type)
+		static_branch_enable(&__scx_is_cid_type);
 
 	/*
 	 * Transition to ENABLING and clear exit info to arm the disable path.
@@ -7022,7 +7112,7 @@ static void scx_sub_enable_workfn(struct kthread_work *work)
 	raw_spin_unlock_irq(&scx_sched_lock);
 
 	/* scx_alloc_and_add_sched() consumes @cgrp whether it succeeds or not */
-	sch = scx_alloc_and_add_sched(ops, cgrp, parent);
+	sch = scx_alloc_and_add_sched(cmd, cgrp, parent);
 	kobject_put(&parent->kobj);
 	if (IS_ERR(sch)) {
 		ret = PTR_ERR(sch);
@@ -7466,6 +7556,13 @@ static int bpf_scx_reg(void *kdata, struct bpf_link *link)
 	return scx_enable(&cmd, link);
 }
 
+static int bpf_scx_reg_cid(void *kdata, struct bpf_link *link)
+{
+	struct scx_enable_cmd cmd = { .ops_cid = kdata, .is_cid_type = true };
+
+	return scx_enable(&cmd, link);
+}
+
 static void bpf_scx_unreg(void *kdata, struct bpf_link *link)
 {
 	struct sched_ext_ops *ops = kdata;
@@ -7595,6 +7692,73 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 	.name = "sched_ext_ops",
 	.owner = THIS_MODULE,
 	.cfi_stubs = &__bpf_ops_sched_ext_ops
+};
+
+/*
+ * cid-form cfi stubs. Stubs whose signatures match the cpu-form (param types
+ * identical, only param names differ across structs) are reused; only
+ * set_cmask needs a fresh stub since the second argument type differs.
+ */
+static void sched_ext_ops_cid__set_cmask(struct task_struct *p,
+					 const struct scx_cmask *cmask) {}
+
+static struct sched_ext_ops_cid __bpf_ops_sched_ext_ops_cid = {
+	.select_cid		= sched_ext_ops__select_cpu,
+	.enqueue		= sched_ext_ops__enqueue,
+	.dequeue		= sched_ext_ops__dequeue,
+	.dispatch		= sched_ext_ops__dispatch,
+	.tick			= sched_ext_ops__tick,
+	.runnable		= sched_ext_ops__runnable,
+	.running		= sched_ext_ops__running,
+	.stopping		= sched_ext_ops__stopping,
+	.quiescent		= sched_ext_ops__quiescent,
+	.yield			= sched_ext_ops__yield,
+	.core_sched_before	= sched_ext_ops__core_sched_before,
+	.set_weight		= sched_ext_ops__set_weight,
+	.set_cmask		= sched_ext_ops_cid__set_cmask,
+	.update_idle		= sched_ext_ops__update_idle,
+	.init_task		= sched_ext_ops__init_task,
+	.exit_task		= sched_ext_ops__exit_task,
+	.enable			= sched_ext_ops__enable,
+	.disable		= sched_ext_ops__disable,
+#ifdef CONFIG_EXT_GROUP_SCHED
+	.cgroup_init		= sched_ext_ops__cgroup_init,
+	.cgroup_exit		= sched_ext_ops__cgroup_exit,
+	.cgroup_prep_move	= sched_ext_ops__cgroup_prep_move,
+	.cgroup_move		= sched_ext_ops__cgroup_move,
+	.cgroup_cancel_move	= sched_ext_ops__cgroup_cancel_move,
+	.cgroup_set_weight	= sched_ext_ops__cgroup_set_weight,
+	.cgroup_set_bandwidth	= sched_ext_ops__cgroup_set_bandwidth,
+	.cgroup_set_idle	= sched_ext_ops__cgroup_set_idle,
+#endif
+	.sub_attach		= sched_ext_ops__sub_attach,
+	.sub_detach		= sched_ext_ops__sub_detach,
+	.cid_online		= sched_ext_ops__cpu_online,
+	.cid_offline		= sched_ext_ops__cpu_offline,
+	.init			= sched_ext_ops__init,
+	.exit			= sched_ext_ops__exit,
+	.dump			= sched_ext_ops__dump,
+	.dump_cid		= sched_ext_ops__dump_cpu,
+	.dump_task		= sched_ext_ops__dump_task,
+};
+
+/*
+ * The cid-form struct_ops shares all bpf_struct_ops hooks with the cpu form.
+ * init_member, check_member, reg, unreg, etc. process kdata as the byte block
+ * verified to match by the BUILD_BUG_ON checks in scx_init().
+ */
+static struct bpf_struct_ops bpf_sched_ext_ops_cid = {
+	.verifier_ops = &bpf_scx_verifier_ops,
+	.reg = bpf_scx_reg_cid,
+	.unreg = bpf_scx_unreg,
+	.check_member = bpf_scx_check_member,
+	.init_member = bpf_scx_init_member,
+	.init = bpf_scx_init,
+	.update = bpf_scx_update,
+	.validate = bpf_scx_validate,
+	.name = "sched_ext_ops_cid",
+	.owner = THIS_MODULE,
+	.cfi_stubs = &__bpf_ops_sched_ext_ops_cid
 };
 
 
@@ -8797,7 +8961,7 @@ __bpf_kfunc s32 scx_bpf_dsq_nr_queued(u64 dsq_id)
 		ret = READ_ONCE(this_rq()->scx.local_dsq.nr);
 		goto out;
 	} else if ((dsq_id & SCX_DSQ_LOCAL_ON) == SCX_DSQ_LOCAL_ON) {
-		s32 cpu = dsq_id & SCX_DSQ_LOCAL_CPU_MASK;
+		s32 cpu = scx_cpu_ret(sch, dsq_id & SCX_DSQ_LOCAL_CPU_MASK);
 
 		if (scx_cpu_valid(sch, cpu, NULL)) {
 			ret = READ_ONCE(cpu_rq(cpu)->scx.local_dsq.nr);
@@ -9893,8 +10057,15 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 
 	/*
 	 * Non-SCX struct_ops: SCX kfuncs are not permitted.
+	 *
+	 * Both bpf_sched_ext_ops (cpu-form) and bpf_sched_ext_ops_cid
+	 * (cid-form) are valid SCX struct_ops. Member offsets match between
+	 * the two (verified by BUILD_BUG_ON in scx_init()), so the shared
+	 * scx_kf_allow_flags[] table indexed by SCX_MOFF_IDX(moff) applies to
+	 * both.
 	 */
-	if (prog->aux->st_ops != &bpf_sched_ext_ops)
+	if (prog->aux->st_ops != &bpf_sched_ext_ops &&
+	    prog->aux->st_ops != &bpf_sched_ext_ops_cid)
 		return -EACCES;
 
 	/* SCX struct_ops: check the per-op allow list. */
@@ -9923,6 +10094,73 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 static int __init scx_init(void)
 {
 	int ret;
+
+	/*
+	 * sched_ext_ops_cid mirrors sched_ext_ops up to and including @priv.
+	 * Both bpf_scx_init_member() and bpf_scx_check_member() use offsets
+	 * from struct sched_ext_ops; sched_ext_ops_cid relies on those offsets
+	 * matching for the shared fields. Catch any drift at boot.
+	 */
+#define CID_OFFSET_MATCH(cpu_field, cid_field)					\
+	BUILD_BUG_ON(offsetof(struct sched_ext_ops, cpu_field) !=		\
+		     offsetof(struct sched_ext_ops_cid, cid_field))
+	/* data fields used by bpf_scx_init_member() */
+	CID_OFFSET_MATCH(dispatch_max_batch, dispatch_max_batch);
+	CID_OFFSET_MATCH(flags, flags);
+	CID_OFFSET_MATCH(name, name);
+	CID_OFFSET_MATCH(timeout_ms, timeout_ms);
+	CID_OFFSET_MATCH(exit_dump_len, exit_dump_len);
+	CID_OFFSET_MATCH(hotplug_seq, hotplug_seq);
+	CID_OFFSET_MATCH(sub_cgroup_id, sub_cgroup_id);
+	/* shared callbacks: the union view requires byte-for-byte offset match */
+	CID_OFFSET_MATCH(enqueue, enqueue);
+	CID_OFFSET_MATCH(dequeue, dequeue);
+	CID_OFFSET_MATCH(dispatch, dispatch);
+	CID_OFFSET_MATCH(tick, tick);
+	CID_OFFSET_MATCH(runnable, runnable);
+	CID_OFFSET_MATCH(running, running);
+	CID_OFFSET_MATCH(stopping, stopping);
+	CID_OFFSET_MATCH(quiescent, quiescent);
+	CID_OFFSET_MATCH(yield, yield);
+	CID_OFFSET_MATCH(core_sched_before, core_sched_before);
+	CID_OFFSET_MATCH(set_weight, set_weight);
+	CID_OFFSET_MATCH(update_idle, update_idle);
+	CID_OFFSET_MATCH(init_task, init_task);
+	CID_OFFSET_MATCH(exit_task, exit_task);
+	CID_OFFSET_MATCH(enable, enable);
+	CID_OFFSET_MATCH(disable, disable);
+	CID_OFFSET_MATCH(dump, dump);
+	CID_OFFSET_MATCH(dump_task, dump_task);
+	CID_OFFSET_MATCH(sub_attach, sub_attach);
+	CID_OFFSET_MATCH(sub_detach, sub_detach);
+	CID_OFFSET_MATCH(init, init);
+	CID_OFFSET_MATCH(exit, exit);
+#ifdef CONFIG_EXT_GROUP_SCHED
+	CID_OFFSET_MATCH(cgroup_init, cgroup_init);
+	CID_OFFSET_MATCH(cgroup_exit, cgroup_exit);
+	CID_OFFSET_MATCH(cgroup_prep_move, cgroup_prep_move);
+	CID_OFFSET_MATCH(cgroup_move, cgroup_move);
+	CID_OFFSET_MATCH(cgroup_cancel_move, cgroup_cancel_move);
+	CID_OFFSET_MATCH(cgroup_set_weight, cgroup_set_weight);
+	CID_OFFSET_MATCH(cgroup_set_bandwidth, cgroup_set_bandwidth);
+	CID_OFFSET_MATCH(cgroup_set_idle, cgroup_set_idle);
+#endif
+	/* renamed callbacks must occupy the same slot as their cpu-form sibling */
+	CID_OFFSET_MATCH(select_cpu, select_cid);
+	CID_OFFSET_MATCH(set_cpumask, set_cmask);
+	CID_OFFSET_MATCH(cpu_online, cid_online);
+	CID_OFFSET_MATCH(cpu_offline, cid_offline);
+	CID_OFFSET_MATCH(dump_cpu, dump_cid);
+	/* @priv tail must align since both share the same data block */
+	CID_OFFSET_MATCH(priv, priv);
+	/*
+	 * cid-form must end exactly at @priv - validate_ops() skips
+	 * cpu_acquire/cpu_release for cid-form because reading those fields
+	 * past the BPF allocation would be UB.
+	 */
+	BUILD_BUG_ON(sizeof(struct sched_ext_ops_cid) !=
+		     offsetofend(struct sched_ext_ops, priv));
+#undef CID_OFFSET_MATCH
 
 	/*
 	 * kfunc registration can't be done from init_sched_ext_class() as
@@ -9971,6 +10209,12 @@ static int __init scx_init(void)
 	ret = register_bpf_struct_ops(&bpf_sched_ext_ops, sched_ext_ops);
 	if (ret) {
 		pr_err("sched_ext: Failed to register struct_ops (%d)\n", ret);
+		return ret;
+	}
+
+	ret = register_bpf_struct_ops(&bpf_sched_ext_ops_cid, sched_ext_ops_cid);
+	if (ret) {
+		pr_err("sched_ext: Failed to register cid struct_ops (%d)\n", ret);
 		return ret;
 	}
 

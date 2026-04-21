@@ -57,6 +57,8 @@ struct scx_cid_topo {
 	s32 node_idx;
 };
 
+const struct scx_cmask *scx_build_cmask_from_cpumask(const struct cpumask *cpumask);
+
 /*
  * Cid space (total is always num_possible_cpus()) is laid out with
  * topology-annotated cids first, then no-topo cids at the tail. The
@@ -143,6 +145,14 @@ static inline s32 scx_cpu_to_cid(struct scx_sched *sch, s32 cpu)
 	if (!scx_cpu_valid(sch, cpu, NULL))
 		return -EINVAL;
 	return __scx_cpu_to_cid(cpu);
+}
+
+/**
+ * scx_is_cid_type - Test whether the active scheduler hierarchy is cid-form
+ */
+static inline bool scx_is_cid_type(void)
+{
+	return static_branch_unlikely(&__scx_is_cid_type);
 }
 
 /*
