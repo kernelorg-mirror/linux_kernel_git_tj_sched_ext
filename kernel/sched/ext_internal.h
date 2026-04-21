@@ -1384,6 +1384,14 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id);
 
 bool scx_cpu_valid(struct scx_sched *sch, s32 cpu, const char *where);
 
+bool scx_vexit(struct scx_sched *sch, enum scx_exit_kind kind, s64 exit_code,
+	       const char *fmt, va_list args);
+__printf(4, 5) bool scx_exit(struct scx_sched *sch, enum scx_exit_kind kind,
+			     s64 exit_code, const char *fmt, ...);
+
+#define scx_verror(sch, fmt, args)	scx_vexit((sch), SCX_EXIT_ERROR, 0, fmt, args)
+#define scx_error(sch, fmt, args...)	scx_exit((sch), SCX_EXIT_ERROR, 0, fmt, ##args)
+
 /*
  * Return the rq currently locked from an scx callback, or NULL if no rq is
  * locked.
