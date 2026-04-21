@@ -73,6 +73,14 @@ int main(int argc, char **argv)
 	libbpf_set_print(libbpf_print_fn);
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
+
+	if (libbpf_num_possible_cpus() > SCX_QMAP_MAX_CPUS) {
+		fprintf(stderr,
+			"scx_qmap: %d possible CPUs exceeds compile-time cap %d; "
+			"rebuild with larger SCX_QMAP_MAX_CPUS\n",
+			libbpf_num_possible_cpus(), SCX_QMAP_MAX_CPUS);
+		return 1;
+	}
 restart:
 	optind = 1;
 	skel = SCX_OPS_OPEN(qmap_ops, scx_qmap);
@@ -162,9 +170,9 @@ restart:
 		long nr_enqueued = qa->nr_enqueued;
 		long nr_dispatched = qa->nr_dispatched;
 
-		printf("stats  : enq=%lu dsp=%lu delta=%ld reenq/cpu0=%llu/%llu deq=%llu core=%llu enq_ddsp=%llu\n",
+		printf("stats  : enq=%lu dsp=%lu delta=%ld reenq/cid0=%llu/%llu deq=%llu core=%llu enq_ddsp=%llu\n",
 		       nr_enqueued, nr_dispatched, nr_enqueued - nr_dispatched,
-		       qa->nr_reenqueued, qa->nr_reenqueued_cpu0,
+		       qa->nr_reenqueued, qa->nr_reenqueued_cid0,
 		       qa->nr_dequeued,
 		       qa->nr_core_sched_execed,
 		       qa->nr_ddsp_from_enq);
@@ -173,7 +181,7 @@ restart:
 		       qa->nr_expedited_remote,
 		       qa->nr_expedited_from_timer,
 		       qa->nr_expedited_lost);
-		if (__COMPAT_has_ksym("scx_bpf_cpuperf_cur"))
+		if (__COMPAT_has_ksym("scx_bpf_cidperf_cur"))
 			printf("cpuperf: cur min/avg/max=%u/%u/%u target min/avg/max=%u/%u/%u\n",
 			       qa->cpuperf_min,
 			       qa->cpuperf_avg,
