@@ -9969,6 +9969,42 @@ static const struct btf_kfunc_id_set scx_kfunc_set_any = {
 };
 
 /*
+ * cpu-form kfuncs that are forbidden from cid-form schedulers
+ * (bpf_sched_ext_ops_cid). Programs targeting the cid struct_ops type must
+ * use the cid-form alternative (cid/cmask kfuncs).
+ *
+ * Membership overlaps with scx_kfunc_ids_{any,idle,select_cpu}; the filter
+ * tests this set independently and rejects matches before the per-op
+ * allow-list check runs.
+ */
+BTF_KFUNCS_START(scx_kfunc_ids_cpu_only)
+BTF_ID_FLAGS(func, scx_bpf_kick_cpu)
+BTF_ID_FLAGS(func, scx_bpf_task_cpu)
+BTF_ID_FLAGS(func, scx_bpf_cpu_rq)
+BTF_ID_FLAGS(func, scx_bpf_cpu_curr)
+BTF_ID_FLAGS(func, scx_bpf_cpu_node)
+BTF_ID_FLAGS(func, scx_bpf_cpuperf_cap)
+BTF_ID_FLAGS(func, scx_bpf_cpuperf_cur)
+BTF_ID_FLAGS(func, scx_bpf_cpuperf_set)
+BTF_ID_FLAGS(func, scx_bpf_get_possible_cpumask)
+BTF_ID_FLAGS(func, scx_bpf_get_online_cpumask)
+BTF_ID_FLAGS(func, scx_bpf_put_cpumask)
+BTF_ID_FLAGS(func, scx_bpf_select_cpu_dfl)
+BTF_ID_FLAGS(func, __scx_bpf_select_cpu_and)
+BTF_ID_FLAGS(func, scx_bpf_select_cpu_and)
+BTF_ID_FLAGS(func, scx_bpf_get_idle_cpumask)
+BTF_ID_FLAGS(func, scx_bpf_get_idle_cpumask_node)
+BTF_ID_FLAGS(func, scx_bpf_get_idle_smtmask)
+BTF_ID_FLAGS(func, scx_bpf_get_idle_smtmask_node)
+BTF_ID_FLAGS(func, scx_bpf_put_idle_cpumask)
+BTF_ID_FLAGS(func, scx_bpf_test_and_clear_cpu_idle)
+BTF_ID_FLAGS(func, scx_bpf_pick_idle_cpu)
+BTF_ID_FLAGS(func, scx_bpf_pick_idle_cpu_node)
+BTF_ID_FLAGS(func, scx_bpf_pick_any_cpu)
+BTF_ID_FLAGS(func, scx_bpf_pick_any_cpu_node)
+BTF_KFUNCS_END(scx_kfunc_ids_cpu_only)
+
+/*
  * Per-op kfunc allow flags. Each bit corresponds to a context-sensitive kfunc
  * group; an op may permit zero or more groups, with the union expressed in
  * scx_kf_allow_flags[]. The verifier-time filter (scx_kfunc_context_filter())
@@ -10031,6 +10067,7 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 	bool in_cpu_release = btf_id_set8_contains(&scx_kfunc_ids_cpu_release, kfunc_id);
 	bool in_idle = btf_id_set8_contains(&scx_kfunc_ids_idle, kfunc_id);
 	bool in_any = btf_id_set8_contains(&scx_kfunc_ids_any, kfunc_id);
+	bool in_cpu_only = btf_id_set8_contains(&scx_kfunc_ids_cpu_only, kfunc_id);
 	u32 moff, flags;
 
 	/* Not an SCX kfunc - allow. */
@@ -10066,6 +10103,15 @@ int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id)
 	 */
 	if (prog->aux->st_ops != &bpf_sched_ext_ops &&
 	    prog->aux->st_ops != &bpf_sched_ext_ops_cid)
+		return -EACCES;
+
+	/*
+	 * cid-form schedulers must use cid/cmask kfuncs. cid and cpu are both
+	 * small s32s and trivially confused, so cpu-only kfuncs are rejected at
+	 * load time. The reverse (cpu-form calling cid-form kfuncs) is
+	 * intentionally permissive to ease gradual cpumask -> cid migration.
+	 */
+	if (prog->aux->st_ops == &bpf_sched_ext_ops_cid && in_cpu_only)
 		return -EACCES;
 
 	/* SCX struct_ops: check the per-op allow list. */
