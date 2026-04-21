@@ -145,4 +145,173 @@ static inline s32 scx_cpu_to_cid(struct scx_sched *sch, s32 cpu)
 	return __scx_cpu_to_cid(cpu);
 }
 
+/*
+ * cmask: variable-length, base-windowed bitmap over cid space
+ * -----------------------------------------------------------
+ *
+ * A cmask covers the cid range [base, base + nr_bits). bits[] is aligned to the
+ * global 64-cid grid: bits[0] spans [base & ~63, (base & ~63) + 64), so the
+ * first (base & 63) bits of bits[0] are head padding and any tail past base +
+ * nr_bits is tail padding. Both must stay zero for the lifetime of the mask;
+ * all mutating helpers preserve that invariant.
+ *
+ * Grid alignment means two cmasks always address bits[] against the same global
+ * 64-cid windows, so cross-cmask word ops (AND, OR, ...) reduce to
+ *
+ *	dest->bits[i] OP= operand->bits[i - delta]
+ *
+ * with no bit-shifting, regardless of how the two bases relate mod 64.
+ *
+ * Binary ops take the form op(dest, operand) and only touch the intersection of
+ * the two ranges on dest; dest bits outside the intersection are left
+ * unchanged. Single-bit ops follow kernel bitops conventions: the bare name is
+ * atomic, the __-prefixed variant is non-atomic. Bulk ops are non-atomic.
+ *
+ * Single-bit ops use atomic64_*() rather than set_bit()/clear_bit() so the u64
+ * storage is addressed consistently across 64-bit and 32-bit-LE kernels
+ * (set_bit() addresses as unsigned long[], which diverges from u64 on
+ * 32-bit-BE). If test_and_set/test_and_clear codegen on x86 matters - they fall
+ * to a LOCK CMPXCHG loop here vs a single LOCK BTS/BTR with the bitops family -
+ * those two can be ifdef'd to the bitops primitives under BITS_PER_LONG == 64.
+ */
+struct scx_cmask {
+	u32 base;
+	u32 nr_bits;
+	DECLARE_FLEX_ARRAY(u64, bits);
+};
+
+/*
+ * Number of u64 words of bits[] storage that covers @nr_bits regardless of base
+ * alignment. The +1 absorbs up to 63 bits of head padding when base is not
+ * 64-aligned - always allocating one extra word beats branching on base or
+ * splitting the compute.
+ */
+#define SCX_CMASK_NR_WORDS(nr_bits)	(((nr_bits) + 63) / 64 + 1)
+
+/*
+ * Define an on-stack cmask for up to @cap_bits. @name is a struct scx_cmask *
+ * aliasing zero-initialized storage; call scx_cmask_init() to set base/nr_bits.
+ */
+#define SCX_CMASK_DEFINE(name, cap_bits)	\
+	DEFINE_RAW_FLEX(struct scx_cmask, name, bits, SCX_CMASK_NR_WORDS(cap_bits))
+
+static inline bool __scx_cmask_contains(const struct scx_cmask *m, u32 cid)
+{
+	return likely(cid >= m->base && cid < m->base + m->nr_bits);
+}
+
+/* Word in bits[] covering @cid. @cid must satisfy __scx_cmask_contains(). */
+static inline u64 *__scx_cmask_word(const struct scx_cmask *m, u32 cid)
+{
+	return (u64 *)&m->bits[cid / 64 - m->base / 64];
+}
+
+static inline void scx_cmask_init(struct scx_cmask *m, u32 base, u32 nr_bits)
+{
+	m->base = base;
+	m->nr_bits = nr_bits;
+	memset(m->bits, 0, SCX_CMASK_NR_WORDS(nr_bits) * sizeof(u64));
+}
+
+static inline bool scx_cmask_test(const struct scx_cmask *m, u32 cid)
+{
+	if (!__scx_cmask_contains(m, cid))
+		return false;
+	return READ_ONCE(*__scx_cmask_word(m, cid)) & BIT_U64(cid & 63);
+}
+
+static inline void scx_cmask_set(struct scx_cmask *m, u32 cid)
+{
+	if (!__scx_cmask_contains(m, cid))
+		return;
+	atomic64_or(BIT_U64(cid & 63), (atomic64_t *)__scx_cmask_word(m, cid));
+}
+
+static inline void scx_cmask_clear(struct scx_cmask *m, u32 cid)
+{
+	if (!__scx_cmask_contains(m, cid))
+		return;
+	atomic64_and(~BIT_U64(cid & 63), (atomic64_t *)__scx_cmask_word(m, cid));
+}
+
+/*
+ * test_and_set/test_and_clear use atomic64_fetch_or/and which lower to a LOCK
+ * CMPXCHG loop on x86 (vs a single LOCK BTS/BTR with test_and_set_bit). If this
+ * ever matters, these two can be ifdef'd to the bitops primitives under
+ * BITS_PER_LONG == 64.
+ */
+static inline bool scx_cmask_test_and_set(struct scx_cmask *m, u32 cid)
+{
+	u64 bit = BIT_U64(cid & 63);
+
+	if (!__scx_cmask_contains(m, cid))
+		return false;
+	return atomic64_fetch_or(bit, (atomic64_t *)__scx_cmask_word(m, cid)) & bit;
+}
+
+static inline bool scx_cmask_test_and_clear(struct scx_cmask *m, u32 cid)
+{
+	u64 bit = BIT_U64(cid & 63);
+
+	if (!__scx_cmask_contains(m, cid))
+		return false;
+	return atomic64_fetch_and(~bit, (atomic64_t *)__scx_cmask_word(m, cid)) & bit;
+}
+
+static inline void __scx_cmask_set(struct scx_cmask *m, u32 cid)
+{
+	if (!__scx_cmask_contains(m, cid))
+		return;
+	*__scx_cmask_word(m, cid) |= BIT_U64(cid & 63);
+}
+
+static inline void __scx_cmask_clear(struct scx_cmask *m, u32 cid)
+{
+	if (!__scx_cmask_contains(m, cid))
+		return;
+	*__scx_cmask_word(m, cid) &= ~BIT_U64(cid & 63);
+}
+
+static inline bool __scx_cmask_test_and_set(struct scx_cmask *m, u32 cid)
+{
+	u64 bit = BIT_U64(cid & 63);
+	u64 *w, prev;
+
+	if (!__scx_cmask_contains(m, cid))
+		return false;
+	w = __scx_cmask_word(m, cid);
+	prev = *w & bit;
+	*w |= bit;
+	return prev;
+}
+
+static inline bool __scx_cmask_test_and_clear(struct scx_cmask *m, u32 cid)
+{
+	u64 bit = BIT_U64(cid & 63);
+	u64 *w, prev;
+
+	if (!__scx_cmask_contains(m, cid))
+		return false;
+	w = __scx_cmask_word(m, cid);
+	prev = *w & bit;
+	*w &= ~bit;
+	return prev;
+}
+
+void scx_cmask_zero(struct scx_cmask *m);
+void scx_cmask_copy(struct scx_cmask *dest, const struct scx_cmask *operand);
+void scx_cmask_and(struct scx_cmask *dest, const struct scx_cmask *operand);
+void scx_cmask_or(struct scx_cmask *dest, const struct scx_cmask *operand);
+u32  scx_cmask_next_set(const struct scx_cmask *m, u32 cid);
+
+static inline u32 scx_cmask_first_set(const struct scx_cmask *m)
+{
+	return scx_cmask_next_set(m, m->base);
+}
+
+#define scx_cmask_for_each_set(cid, m)						\
+	for ((cid) = scx_cmask_first_set(m);					\
+	     (cid) < (m)->base + (m)->nr_bits;					\
+	     (cid) = scx_cmask_next_set((m), (cid) + 1))
+
 #endif /* _KERNEL_SCHED_EXT_CID_H */

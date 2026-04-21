@@ -365,6 +365,145 @@ static const struct btf_kfunc_id_set scx_kfunc_set_cid = {
 	.set	= &scx_kfunc_ids_cid,
 };
 
+/*
+ * cmask bulk ops. See ext_cid.h for the layout and semantics: binary ops only
+ * touch the intersection of dest and operand ranges; dest bits outside the
+ * intersection, and dest head/tail padding, are left untouched. The 64-cid grid
+ * alignment of bits[] makes the word-to-word correspondence trivial.
+ */
+enum {
+	CMASK_OP_AND,
+	CMASK_OP_OR,
+	CMASK_OP_COPY,
+};
+
+void scx_cmask_zero(struct scx_cmask *m)
+{
+	memset(m->bits, 0, SCX_CMASK_NR_WORDS(m->nr_bits) * sizeof(u64));
+}
+
+/*
+ * Apply @op to one word - dest[@di] = (dest[@di] & ~@mask) | (op(...) & @mask).
+ * Only bits in @mask within the word are touched.
+ */
+static void cmask_op_word(struct scx_cmask *dest, const struct scx_cmask *operand,
+			  u32 di, u32 oi, u64 mask, int op)
+{
+	u64 dv = dest->bits[di];
+	u64 ov = operand->bits[oi];
+	u64 rv;
+
+	switch (op) {
+	case CMASK_OP_AND:
+		rv = dv & ov;
+		break;
+	case CMASK_OP_OR:
+		rv = dv | ov;
+		break;
+	case CMASK_OP_COPY:
+		rv = ov;
+		break;
+	default:
+		BUG();
+	}
+
+	dest->bits[di] = (dv & ~mask) | (rv & mask);
+}
+
+static void cmask_op(struct scx_cmask *dest, const struct scx_cmask *operand, int op)
+{
+	u32 lo = max(dest->base, operand->base);
+	u32 hi = min(dest->base + dest->nr_bits,
+		     operand->base + operand->nr_bits);
+	u32 d_base = dest->base / 64;
+	u32 o_base = operand->base / 64;
+	u32 lo_word, hi_word, w;
+	u64 head_mask, tail_mask;
+
+	if (lo >= hi)
+		return;
+
+	lo_word = lo / 64;
+	hi_word = (hi - 1) / 64;
+	head_mask = GENMASK_U64(63, lo & 63);
+	tail_mask = GENMASK_U64((hi - 1) & 63, 0);
+
+	/* intersection fits in a single word - apply both head and tail */
+	if (lo_word == hi_word) {
+		cmask_op_word(dest, operand, lo_word - d_base, lo_word - o_base,
+			      head_mask & tail_mask, op);
+		return;
+	}
+
+	/* first word: head mask */
+	cmask_op_word(dest, operand, lo_word - d_base, lo_word - o_base, head_mask, op);
+
+	/* interior words: unmasked */
+	for (w = lo_word + 1; w < hi_word; w++)
+		cmask_op_word(dest, operand, w - d_base, w - o_base,
+			      GENMASK_U64(63, 0), op);
+
+	/* last word: tail mask */
+	cmask_op_word(dest, operand, hi_word - d_base, hi_word - o_base, tail_mask, op);
+}
+
+/*
+ * scx_cmask_and/or/copy only modify @dest bits that lie in the intersection
+ * of [@dest->base, @dest->base + @dest->nr_bits) and [@operand->base,
+ * @operand->base + @operand->nr_bits). Bits in @dest outside that window keep
+ * their prior values - in particular, scx_cmask_copy() does NOT zero @dest
+ * bits that lie outside @operand's range.
+ */
+void scx_cmask_and(struct scx_cmask *dest, const struct scx_cmask *operand)
+{
+	cmask_op(dest, operand, CMASK_OP_AND);
+}
+
+void scx_cmask_or(struct scx_cmask *dest, const struct scx_cmask *operand)
+{
+	cmask_op(dest, operand, CMASK_OP_OR);
+}
+
+void scx_cmask_copy(struct scx_cmask *dest, const struct scx_cmask *operand)
+{
+	cmask_op(dest, operand, CMASK_OP_COPY);
+}
+
+/**
+ * scx_cmask_next_set - find the first set bit at or after @cid
+ * @m: cmask to search
+ * @cid: starting cid (clamped to @m->base if below)
+ *
+ * Returns the smallest set cid in [@cid, @m->base + @m->nr_bits), or
+ * @m->base + @m->nr_bits if none (the out-of-range sentinel matches the
+ * termination condition used by scx_cmask_for_each_set()).
+ */
+u32 scx_cmask_next_set(const struct scx_cmask *m, u32 cid)
+{
+	u32 end = m->base + m->nr_bits;
+	u32 base = m->base / 64;
+	u32 last_wi = (end - 1) / 64 - base;
+	u32 wi;
+	u64 word;
+
+	if (cid < m->base)
+		cid = m->base;
+	if (cid >= end)
+		return end;
+
+	wi = cid / 64 - base;
+	word = m->bits[wi] & GENMASK_U64(63, cid & 63);
+
+	while (!word) {
+		if (++wi > last_wi)
+			return end;
+		word = m->bits[wi];
+	}
+
+	cid = (base + wi) * 64 + __ffs64(word);
+	return cid < end ? cid : end;
+}
+
 int scx_cid_kfunc_init(void)
 {
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &scx_kfunc_set_init) ?:
