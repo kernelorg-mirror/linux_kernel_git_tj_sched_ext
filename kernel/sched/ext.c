@@ -8619,7 +8619,7 @@ __bpf_kfunc bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice,
 
 	guard(rcu)();
 	sch = scx_prog_sched(aux);
-	if (unlikely(!scx_task_on_sched(sch, p)))
+	if (unlikely(!sch || !scx_task_on_sched(sch, p)))
 		return false;
 
 	p->scx.slice = slice;
@@ -8642,7 +8642,7 @@ __bpf_kfunc bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime,
 
 	guard(rcu)();
 	sch = scx_prog_sched(aux);
-	if (unlikely(!scx_task_on_sched(sch, p)))
+	if (unlikely(!sch || !scx_task_on_sched(sch, p)))
 		return false;
 
 	p->scx.dsq_vtime = vtime;
