@@ -61,6 +61,7 @@
 # include "ext_types.h"
 # include "ext_internal.h"
 # include "ext.c"
+# include "ext_cid.c"
 # include "ext_idle.c"
 #endif
 
