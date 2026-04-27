@@ -85,6 +85,19 @@ u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena)
 	return arena ? arena->user_vm_start : 0;
 }
 
+/**
+ * bpf_arena_map_kern_vm_start - kern_vm_start lookup by struct bpf_map *
+ * @map: a BPF_MAP_TYPE_ARENA map
+ *
+ * Return @map's kern_vm_start, or 0 (with WARN) if @map isn't an arena.
+ */
+u64 bpf_arena_map_kern_vm_start(struct bpf_map *map)
+{
+	if (WARN_ON_ONCE(!map || map->map_type != BPF_MAP_TYPE_ARENA))
+		return 0;
+	return bpf_arena_get_kern_vm_start(container_of(map, struct bpf_arena, map));
+}
+
 static long arena_map_peek_elem(struct bpf_map *map, void *value)
 {
 	return -EOPNOTSUPP;
