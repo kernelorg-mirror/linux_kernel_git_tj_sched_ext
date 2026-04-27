@@ -1456,6 +1456,13 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* Keep every kernel-side PTE in a BPF_MAP_TYPE_ARENA backed by a per-arena
+ * "garbage" page so that kernel-side accesses anywhere in the arena's 4G range
+ * never fault. Loads from unallocated or freed regions return indeterminate
+ * bytes; stores are silently absorbed. Userspace mappings are unaffected.
+ */
+	BPF_F_ARENA_MAP_ALWAYS	= (1U << 20),
 };
 
 /* Flags for BPF_PROG_QUERY. */

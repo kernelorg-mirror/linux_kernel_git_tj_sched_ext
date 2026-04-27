@@ -62,6 +62,8 @@ struct bpf_arena {
 	struct irq_work     free_irq;
 	struct work_struct  free_work;
 	struct llist_head   free_spans;
+	/* BPF_F_ARENA_MAP_ALWAYS fallback page; NULL if the flag is off */
+	struct page *garbage_page;
 };
 
 static void arena_free_worker(struct work_struct *work);
@@ -127,12 +129,14 @@ struct apply_range_clear_data {
 static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
 {
 	struct apply_range_data *d = data;
+	pte_t old_pte;
 	struct page *page;
 
 	if (!d->pages)
 		return 0;
-	/* sanity check */
-	if (unlikely(!pte_none(ptep_get(pte))))
+	/* slot must be empty, or point to garbage if MAP_ALWAYS */
+	old_pte = ptep_get(pte);
+	if (unlikely(!pte_none(old_pte) && pte_page(old_pte) != d->arena->garbage_page))
 		return -EBUSY;
 
 	page = d->pages[d->i];
@@ -153,6 +157,7 @@ static void flush_vmap_cache(unsigned long start, unsigned long size)
 static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
 {
 	struct apply_range_clear_data *d = data;
+	struct page *garbage = d->arena->garbage_page;
 	pte_t old_pte;
 	struct page *page;
 
@@ -165,7 +170,14 @@ static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
 	if (WARN_ON_ONCE(!page))
 		return -EINVAL;
 
-	pte_clear(&init_mm, addr, pte);
+	if (garbage) {
+		/* if already cleared, must not free the shared garbage page */
+		if (page == garbage)
+			return 0;
+		set_pte_at(&init_mm, addr, pte, mk_pte(garbage, PAGE_KERNEL));
+	} else {
+		pte_clear(&init_mm, addr, pte);
+	}
 
 	/* Add page to the list so it is freed later */
 	if (d->free_pages)
@@ -180,6 +192,21 @@ static int populate_pgtable_except_pte(struct bpf_arena *arena)
 
 	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
 				   KERN_VM_SZ - GUARD_SZ, apply_range_set_cb, &data);
+}
+
+static int populate_garbage_pte_cb(pte_t *pte, unsigned long addr, void *data)
+{
+	struct page *garbage = data;
+
+	set_pte_at(&init_mm, addr, pte, mk_pte(garbage, PAGE_KERNEL));
+	return 0;
+}
+
+static int populate_pgtable_with_garbage(struct bpf_arena *arena)
+{
+	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
+				   KERN_VM_SZ - GUARD_SZ, populate_garbage_pte_cb,
+				   arena->garbage_page);
 }
 
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
@@ -197,7 +224,8 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	    /* BPF_F_MMAPABLE must be set */
 	    !(attr->map_flags & BPF_F_MMAPABLE) ||
 	    /* No unsupported flags present */
-	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV)))
+	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV |
+				 BPF_F_ARENA_MAP_ALWAYS)))
 		return ERR_PTR(-EINVAL);
 
 	if (attr->map_extra & ~PAGE_MASK)
@@ -245,7 +273,23 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		goto err;
 	}
 
+	if (attr->map_flags & BPF_F_ARENA_MAP_ALWAYS) {
+		arena->garbage_page = alloc_page(GFP_KERNEL);
+		if (!arena->garbage_page) {
+			err = -ENOMEM;
+			goto err_free_arena;
+		}
+		err = populate_pgtable_with_garbage(arena);
+		if (err)
+			goto err_free_garbage;
+	}
+
 	return &arena->map;
+err_free_garbage:
+	__free_page(arena->garbage_page);
+err_free_arena:
+	range_tree_destroy(&arena->rt);
+	bpf_map_area_free(arena);
 err:
 	free_vm_area(kern_vm);
 	return ERR_PTR(err);
@@ -253,6 +297,7 @@ err:
 
 static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 {
+	struct bpf_arena *arena = data;
 	struct page *page;
 	pte_t pte;
 
@@ -260,6 +305,9 @@ static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 	if (!pte_present(pte)) /* sanity check */
 		return 0;
 	page = pte_page(pte);
+	/* garbage is shared and will be freed once later */
+	if (page == arena->garbage_page)
+		return 0;
 	/*
 	 * We do not update pte here:
 	 * 1. Nobody should be accessing bpf_arena's range outside of a kernel bug
@@ -297,6 +345,8 @@ static void arena_map_free(struct bpf_map *map)
 	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
 				     KERN_VM_SZ - GUARD_SZ, existing_page_cb, arena);
 	free_vm_area(arena->kern_vm);
+	if (arena->garbage_page)
+		__free_page(arena->garbage_page);
 	range_tree_destroy(&arena->rt);
 	bpf_map_area_free(arena);
 }
@@ -383,8 +433,10 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		return VM_FAULT_RETRY;
 
 	page = vmalloc_to_page((void *)kaddr);
+	if (page == arena->garbage_page)
+		page = NULL;
 	if (page)
-		/* already have a page vmap-ed */
+		/* already have a real page vmap-ed */
 		goto out;
 
 	bpf_map_memcg_enter(&arena->map, &old_memcg, &new_memcg);
