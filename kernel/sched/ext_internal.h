@@ -1108,8 +1108,14 @@ struct scx_sched {
 	 * cid-form schedulers must use exactly one arena with
 	 * BPF_F_ARENA_MAP_ALWAYS to enable direct arena access from kernel
 	 * side. NULL on cpu-form.
+	 *
+	 * @arena_pool sub-allocates @arena_map. Each gen_pool chunk is added
+	 * with kern_va as the "virt" address and the matching BPF uaddr as the
+	 * "phys", so gen_pool_virt_to_phys() recovers the uaddr for handing to
+	 * BPF. Grows on demand and pages are not released until sched destroy.
 	 */
 	struct bpf_map		*arena_map;
+	struct gen_pool		*arena_pool;
 
 	DECLARE_BITMAP(has_op, SCX_OPI_END);
 
