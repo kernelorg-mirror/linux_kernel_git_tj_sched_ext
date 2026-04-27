@@ -114,8 +114,14 @@ static long compute_pgoff(struct bpf_arena *arena, long uaddr)
 }
 
 struct apply_range_data {
-	struct page **pages;
+	struct bpf_arena *arena;
+	struct page **pages;	/* NULL: skip PTE install */
 	int i;
+};
+
+struct apply_range_clear_data {
+	struct bpf_arena *arena;
+	struct llist_head *free_pages;
 };
 
 static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
@@ -123,7 +129,7 @@ static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
 	struct apply_range_data *d = data;
 	struct page *page;
 
-	if (!data)
+	if (!d->pages)
 		return 0;
 	/* sanity check */
 	if (unlikely(!pte_none(ptep_get(pte))))
@@ -144,8 +150,9 @@ static void flush_vmap_cache(unsigned long start, unsigned long size)
 	flush_cache_vmap(start, start + size);
 }
 
-static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *free_pages)
+static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
 {
+	struct apply_range_clear_data *d = data;
 	pte_t old_pte;
 	struct page *page;
 
@@ -161,16 +168,18 @@ static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *free_pages
 	pte_clear(&init_mm, addr, pte);
 
 	/* Add page to the list so it is freed later */
-	if (free_pages)
-		__llist_add(&page->pcp_llist, free_pages);
+	if (d->free_pages)
+		__llist_add(&page->pcp_llist, d->free_pages);
 
 	return 0;
 }
 
 static int populate_pgtable_except_pte(struct bpf_arena *arena)
 {
+	struct apply_range_data data = { .arena = arena };
+
 	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				   KERN_VM_SZ - GUARD_SZ, apply_range_set_cb, NULL);
+				   KERN_VM_SZ - GUARD_SZ, apply_range_set_cb, &data);
 }
 
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
@@ -286,7 +295,7 @@ static void arena_map_free(struct bpf_map *map)
 	 * free those pages.
 	 */
 	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				     KERN_VM_SZ - GUARD_SZ, existing_page_cb, NULL);
+				     KERN_VM_SZ - GUARD_SZ, existing_page_cb, arena);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
 	bpf_map_area_free(arena);
@@ -388,7 +397,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 	if (ret)
 		goto out_unlock_sigsegv;
 
-	struct apply_range_data data = { .pages = &page, .i = 0 };
+	struct apply_range_data data = { .arena = arena, .pages = &page, .i = 0 };
 	/* Account into memcg of the process that created bpf_arena */
 	ret = bpf_map_alloc_pages(map, NUMA_NO_NODE, 1, &page);
 	if (ret) {
@@ -569,6 +578,7 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 		bpf_map_memcg_exit(old_memcg, new_memcg);
 		return 0;
 	}
+	data.arena = arena;
 	data.pages = pages;
 
 	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
@@ -696,9 +706,13 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	range_tree_set(&arena->rt, pgoff, page_cnt);
 
 	init_llist_head(&free_pages);
+	struct apply_range_clear_data clear_data = {
+		.arena = arena,
+		.free_pages = &free_pages,
+	};
 	/* clear ptes and collect struct pages */
 	apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
-				     apply_range_clear_cb, &free_pages);
+				     apply_range_clear_cb, &clear_data);
 
 	/* drop the lock to do the tlb flush and zap pages */
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
@@ -804,6 +818,11 @@ static void arena_free_worker(struct work_struct *work)
 	arena_vm_start = bpf_arena_get_kern_vm_start(arena);
 	user_vm_start = bpf_arena_get_user_vm_start(arena);
 
+	struct apply_range_clear_data clear_data = {
+		.arena = arena,
+		.free_pages = &free_pages,
+	};
+
 	list = llist_del_all(&arena->free_spans);
 	llist_for_each(pos, list) {
 		s = llist_entry(pos, struct arena_free_span, node);
@@ -813,7 +832,7 @@ static void arena_free_worker(struct work_struct *work)
 
 		/* clear ptes and collect pages in free_pages llist */
 		apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
-					     apply_range_clear_cb, &free_pages);
+					     apply_range_clear_cb, &clear_data);
 
 		range_tree_set(&arena->rt, pgoff, page_cnt);
 	}
