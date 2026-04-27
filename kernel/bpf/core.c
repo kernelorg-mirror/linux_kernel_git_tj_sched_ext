@@ -2510,6 +2510,35 @@ out:
 	return ret;
 }
 
+/**
+ * bpf_prog_for_each_used_map - Invoke @cb for each map @prog references
+ * @prog: BPF program whose used_maps to walk
+ * @cb: callback invoked once per map; non-zero return stops iteration
+ * @data: opaque argument passed to @cb
+ *
+ * Holds prog->aux->used_maps_mutex across the walk.
+ *
+ * Return 0 if iteration completed, otherwise the first non-zero @cb return.
+ */
+int bpf_prog_for_each_used_map(struct bpf_prog *prog,
+			       int (*cb)(struct bpf_map *map, void *data),
+			       void *data)
+{
+	struct bpf_prog_aux *aux = prog->aux;
+	int ret = 0;
+	u32 i;
+
+	mutex_lock(&aux->used_maps_mutex);
+	for (i = 0; i < aux->used_map_cnt; i++) {
+		ret = cb(aux->used_maps[i], data);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&aux->used_maps_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(bpf_prog_for_each_used_map);
+
 static bool bpf_prog_select_interpreter(struct bpf_prog *fp)
 {
 	bool select_interpreter = false;

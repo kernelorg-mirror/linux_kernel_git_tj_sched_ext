@@ -2338,6 +2338,9 @@ static inline bool map_type_contains_progs(struct bpf_map *map)
 
 bool bpf_prog_map_compatible(struct bpf_map *map, const struct bpf_prog *fp);
 int bpf_prog_calc_tag(struct bpf_prog *fp);
+int bpf_prog_for_each_used_map(struct bpf_prog *prog,
+			       int (*cb)(struct bpf_map *map, void *data),
+			       void *data);
 
 const struct bpf_func_proto *bpf_get_trace_printk_proto(void);
 const struct bpf_func_proto *bpf_get_trace_vprintk_proto(void);
