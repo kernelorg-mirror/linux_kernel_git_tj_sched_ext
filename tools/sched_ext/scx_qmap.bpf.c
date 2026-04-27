@@ -83,7 +83,7 @@ UEI_DEFINE(uei);
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARENA);
-	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(map_flags, BPF_F_MMAPABLE | BPF_F_ARENA_MAP_ALWAYS);
 	__uint(max_entries, 1 << 16);		/* upper bound in pages */
 #if defined(__TARGET_ARCH_arm64) || defined(__aarch64__)
 	__ulong(map_extra, 0x1ull << 32);	/* user/BPF mmap base */
