@@ -8,6 +8,7 @@
 #include <linux/sched/task_stack.h>	/* task_stack_*(), ...		*/
 #include <linux/kdebug.h>		/* oops_begin/end, ...		*/
 #include <linux/memblock.h>		/* max_low_pfn			*/
+#include <linux/bpf.h>			/* bpf_arena_handle_page_fault	*/
 #include <linux/kfence.h>		/* kfence_handle_page_fault	*/
 #include <linux/kprobes.h>		/* NOKPROBE_SYMBOL, ...		*/
 #include <linux/mmiotrace.h>		/* kmmio_handler, ...		*/
@@ -691,6 +692,10 @@ page_fault_oops(struct pt_regs *regs, unsigned long error_code,
 	/* Only not-present faults should be handled by KFENCE. */
 	if (!(error_code & X86_PF_PROT) &&
 	    kfence_handle_page_fault(address, error_code & X86_PF_WRITE, regs))
+		return;
+
+	if (!(error_code & X86_PF_PROT) &&
+	    bpf_arena_handle_page_fault(address, error_code & X86_PF_WRITE, regs->ip))
 		return;
 
 oops:

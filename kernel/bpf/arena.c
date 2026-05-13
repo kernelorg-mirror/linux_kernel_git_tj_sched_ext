@@ -53,6 +53,7 @@ struct bpf_arena {
 	u64 user_vm_start;
 	u64 user_vm_end;
 	struct vm_struct *kern_vm;
+	struct page *scratch_page;
 	struct range_tree rt;
 	/* protects rt */
 	rqspinlock_t spinlock;
@@ -115,19 +116,30 @@ static long compute_pgoff(struct bpf_arena *arena, long uaddr)
 
 struct apply_range_data {
 	struct page **pages;
+	struct page *scratch_page;
 	int i;
+};
+
+struct clear_range_data {
+	struct llist_head *free_pages;
+	struct page *scratch_page;
 };
 
 static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
 {
 	struct apply_range_data *d = data;
+	pte_t old_pte;
 	struct page *page;
 
 	if (!data)
 		return 0;
 	/* sanity check */
-	if (unlikely(!pte_none(ptep_get(pte))))
-		return -EBUSY;
+	old_pte = ptep_get(pte);
+	if (unlikely(!pte_none(old_pte))) {
+		if (!d->scratch_page || !pte_present(old_pte) ||
+		    pte_page(old_pte) != d->scratch_page)
+			return -EBUSY;
+	}
 
 	page = d->pages[d->i];
 	/* paranoia, similar to vmap_pages_pte_range() */
@@ -146,6 +158,7 @@ static void flush_vmap_cache(unsigned long start, unsigned long size)
 
 static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *free_pages)
 {
+	struct clear_range_data *d = free_pages;
 	pte_t old_pte;
 	struct page *page;
 
@@ -161,16 +174,26 @@ static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *free_pages
 	pte_clear(&init_mm, addr, pte);
 
 	/* Add page to the list so it is freed later */
-	if (free_pages)
-		__llist_add(&page->pcp_llist, free_pages);
+	if (d && page != d->scratch_page)
+		__llist_add(&page->pcp_llist, d->free_pages);
 
+	return 0;
+}
+
+static int apply_range_set_scratch_cb(pte_t *pte, unsigned long addr, void *data)
+{
+	struct page *scratch_page = data;
+
+	if (!pte_none(ptep_get(pte)))
+		return 0;
+	ptep_try_install(pte, mk_pte(scratch_page, PAGE_KERNEL));
 	return 0;
 }
 
 static int populate_pgtable_except_pte(struct bpf_arena *arena)
 {
-	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				   KERN_VM_SZ - GUARD_SZ, apply_range_set_cb, NULL);
+	return apply_to_page_range(&init_mm, (unsigned long)arena->kern_vm->addr,
+				   KERN_VM_SZ, apply_range_set_cb, NULL);
 }
 
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
@@ -221,9 +244,17 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	init_irq_work(&arena->free_irq, arena_free_irq);
 	INIT_WORK(&arena->free_work, arena_free_worker);
 	bpf_map_init_from_attr(&arena->map, attr);
+
+	err = bpf_map_alloc_pages(&arena->map, NUMA_NO_NODE, 1, &arena->scratch_page);
+	if (err) {
+		bpf_map_area_free(arena);
+		goto err;
+	}
+
 	range_tree_init(&arena->rt);
 	err = range_tree_set(&arena->rt, 0, attr->max_entries);
 	if (err) {
+		__free_page(arena->scratch_page);
 		bpf_map_area_free(arena);
 		goto err;
 	}
@@ -232,6 +263,7 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	err = populate_pgtable_except_pte(arena);
 	if (err) {
 		range_tree_destroy(&arena->rt);
+		__free_page(arena->scratch_page);
 		bpf_map_area_free(arena);
 		goto err;
 	}
@@ -244,6 +276,7 @@ err:
 
 static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 {
+	struct bpf_arena *arena = data;
 	struct page *page;
 	pte_t pte;
 
@@ -251,6 +284,8 @@ static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 	if (!pte_present(pte)) /* sanity check */
 		return 0;
 	page = pte_page(pte);
+	if (page == arena->scratch_page)
+		return 0;
 	/*
 	 * We do not update pte here:
 	 * 1. Nobody should be accessing bpf_arena's range outside of a kernel bug
@@ -285,10 +320,11 @@ static void arena_map_free(struct bpf_map *map)
 	 * Call apply_to_existing_page_range() first to find populated ptes and
 	 * free those pages.
 	 */
-	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
-				     KERN_VM_SZ - GUARD_SZ, existing_page_cb, NULL);
+	apply_to_existing_page_range(&init_mm, (unsigned long)arena->kern_vm->addr,
+				     KERN_VM_SZ, existing_page_cb, arena);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
+	__free_page(arena->scratch_page);
 	bpf_map_area_free(arena);
 }
 
@@ -374,7 +410,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		return VM_FAULT_RETRY;
 
 	page = vmalloc_to_page((void *)kaddr);
-	if (page)
+	if (page && page != arena->scratch_page)
 		/* already have a page vmap-ed */
 		goto out;
 
@@ -389,6 +425,7 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		goto out_unlock_sigsegv;
 
 	struct apply_range_data data = { .pages = &page, .i = 0 };
+	data.scratch_page = arena->scratch_page;
 	/* Account into memcg of the process that created bpf_arena */
 	ret = bpf_map_alloc_pages(map, NUMA_NO_NODE, 1, &page);
 	if (ret) {
@@ -570,6 +607,7 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 		return 0;
 	}
 	data.pages = pages;
+	data.scratch_page = arena->scratch_page;
 
 	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
 		goto out_free_pages;
@@ -668,6 +706,7 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	struct llist_head free_pages;
 	struct llist_node *pos, *t;
 	struct arena_free_span *s;
+	struct clear_range_data cdata;
 	unsigned long flags;
 	int ret = 0;
 
@@ -696,9 +735,11 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	range_tree_set(&arena->rt, pgoff, page_cnt);
 
 	init_llist_head(&free_pages);
+	cdata.free_pages = &free_pages;
+	cdata.scratch_page = arena->scratch_page;
 	/* clear ptes and collect struct pages */
 	apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
-				     apply_range_clear_cb, &free_pages);
+				     apply_range_clear_cb, &cdata);
 
 	/* drop the lock to do the tlb flush and zap pages */
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
@@ -788,6 +829,7 @@ static void arena_free_worker(struct work_struct *work)
 	struct arena_free_span *s;
 	u64 arena_vm_start, user_vm_start;
 	struct llist_head free_pages;
+	struct clear_range_data cdata;
 	struct page *page;
 	unsigned long full_uaddr;
 	long kaddr, page_cnt, pgoff;
@@ -801,6 +843,8 @@ static void arena_free_worker(struct work_struct *work)
 	bpf_map_memcg_enter(&arena->map, &old_memcg, &new_memcg);
 
 	init_llist_head(&free_pages);
+	cdata.free_pages = &free_pages;
+	cdata.scratch_page = arena->scratch_page;
 	arena_vm_start = bpf_arena_get_kern_vm_start(arena);
 	user_vm_start = bpf_arena_get_user_vm_start(arena);
 
@@ -813,7 +857,7 @@ static void arena_free_worker(struct work_struct *work)
 
 		/* clear ptes and collect pages in free_pages llist */
 		apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
-					     apply_range_clear_cb, &free_pages);
+					     apply_range_clear_cb, &cdata);
 
 		range_tree_set(&arena->rt, pgoff, page_cnt);
 	}
@@ -928,6 +972,38 @@ static int __init kfunc_init(void)
 }
 late_initcall(kfunc_init);
 
+bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write, unsigned long fault_ip)
+{
+	struct bpf_arena *arena;
+	struct bpf_prog *prog;
+	unsigned long kbase;
+	unsigned long start;
+	unsigned long page_addr = addr & PAGE_MASK;
+	bool handled = false;
+
+	prog = bpf_prog_find_from_stack();
+	if (!prog || !prog->aux->arena)
+		return false;
+
+	arena = prog->aux->arena;
+	start = (unsigned long)arena->kern_vm->addr;
+	if (page_addr < start || page_addr >= start + KERN_VM_SZ)
+		return false;
+
+	if (!apply_to_page_range(&init_mm, page_addr, PAGE_SIZE,
+				 apply_range_set_scratch_cb, arena->scratch_page)) {
+		flush_vmap_cache(page_addr, PAGE_SIZE);
+		handled = true;
+	}
+
+	if (handled) {
+		kbase = bpf_arena_get_kern_vm_start(arena);
+		bpf_prog_report_arena_violation(is_write, page_addr - kbase, fault_ip);
+	}
+
+	return handled;
+}
+
 void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned long fault_ip)
 {
 	struct bpf_stream_stage ss;
@@ -943,6 +1019,8 @@ void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned lo
 	prog = bpf_prog_ksym_find(fault_ip);
 	rcu_read_unlock();
 	if (!prog)
+		prog = bpf_prog_find_from_stack();
+	if (!prog || !prog->aux->arena)
 		return;
 
 	/* Use main prog for stream access */
