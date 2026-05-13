@@ -621,11 +621,15 @@ static inline void scx_call_op_set_cpumask(struct scx_sched *sch, struct rq *rq,
 		update_locked_rq(rq);
 
 	if (scx_is_cid_type()) {
-		struct scx_cmask *cmask = this_cpu_ptr(scx_set_cmask_scratch);
+		struct scx_cmask_scratch *s = this_cpu_ptr(sch->set_cmask_scratch);
 
-		lockdep_assert_irqs_disabled();
-		scx_cpumask_to_cmask(cpumask, cmask);
-		sch->ops_cid.set_cmask(task, cmask);
+		/*
+		 * Build the per-CPU arena cmask and hand BPF the uaddr. Caller
+		 * holds the rq lock with IRQs disabled, which makes us the sole
+		 * user of the scratch area.
+		 */
+		scx_cpumask_to_cmask(cpumask, s->kern_va);
+		sch->ops_cid.set_cmask(task, (struct scx_cmask *)(unsigned long)s->uaddr);
 	} else {
 		sch->ops.set_cpumask(task, cpumask);
 	}
@@ -4949,6 +4953,48 @@ static const struct attribute_group scx_global_attr_group = {
 static void free_pnode(struct scx_sched_pnode *pnode);
 static void free_exit_info(struct scx_exit_info *ei);
 
+static s32 scx_set_cmask_scratch_alloc(struct scx_sched *sch)
+{
+	size_t size = struct_size_t(struct scx_cmask, bits,
+				    SCX_CMASK_NR_WORDS(num_possible_cpus()));
+	int cpu;
+
+	if (!sch->is_cid_type || !sch->arena_pool)
+		return 0;
+
+	sch->set_cmask_scratch = alloc_percpu(struct scx_cmask_scratch);
+	if (!sch->set_cmask_scratch)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu) {
+		struct scx_cmask_scratch *s = per_cpu_ptr(sch->set_cmask_scratch, cpu);
+
+		s->kern_va = scx_arena_alloc(sch, size, &s->uaddr);
+		if (!s->kern_va)
+			return -ENOMEM;
+		scx_cmask_init(s->kern_va, 0, num_possible_cpus());
+	}
+	return 0;
+}
+
+static void scx_set_cmask_scratch_free(struct scx_sched *sch)
+{
+	size_t size = struct_size_t(struct scx_cmask, bits,
+				    SCX_CMASK_NR_WORDS(num_possible_cpus()));
+	int cpu;
+
+	if (!sch->set_cmask_scratch)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct scx_cmask_scratch *s = per_cpu_ptr(sch->set_cmask_scratch, cpu);
+
+		scx_arena_free(sch, s->kern_va, size);
+	}
+	free_percpu(sch->set_cmask_scratch);
+	sch->set_cmask_scratch = NULL;
+}
+
 static void scx_sched_free_rcu_work(struct work_struct *work)
 {
 	struct rcu_work *rcu_work = to_rcu_work(work);
@@ -5003,6 +5049,7 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 
 	rhashtable_free_and_destroy(&sch->dsq_hash, NULL, NULL);
 	free_exit_info(sch->exit_info);
+	scx_set_cmask_scratch_free(sch);
 	scx_arena_pool_destroy(sch);
 	if (sch->arena_map)
 		bpf_map_put(sch->arena_map);
@@ -7142,6 +7189,12 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		goto err_disable;
 	}
 
+	ret = scx_set_cmask_scratch_alloc(sch);
+	if (ret) {
+		cpus_read_unlock();
+		goto err_disable;
+	}
+
 	for (i = SCX_OPI_CPU_HOTPLUG_BEGIN; i < SCX_OPI_CPU_HOTPLUG_END; i++)
 		if (((void (**)(void))ops)[i])
 			set_bit(i, sch->has_op);
@@ -7461,6 +7514,10 @@ static void scx_sub_enable_workfn(struct kthread_work *work)
 	}
 
 	ret = scx_arena_pool_init(sch);
+	if (ret)
+		goto err_disable;
+
+	ret = scx_set_cmask_scratch_alloc(sch);
 	if (ret)
 		goto err_disable;
 

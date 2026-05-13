@@ -101,4 +101,14 @@ struct scx_cmask {
 #define SCX_CMASK_DEFINE(name, cap_bits)	\
 	DEFINE_RAW_FLEX(struct scx_cmask, name, bits, SCX_CMASK_NR_WORDS(cap_bits))
 
+/*
+ * Stash for one arena-resident cmask. @kern_va points into the kernel's
+ * view of the BPF arena; @uaddr is the matching BPF-arena address to
+ * hand to BPF (cast to struct scx_cmask *).
+ */
+struct scx_cmask_scratch {
+	struct scx_cmask *kern_va;
+	u32 uaddr;
+};
+
 #endif /* _KERNEL_SCHED_EXT_TYPES_H */
