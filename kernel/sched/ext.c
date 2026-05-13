@@ -3816,22 +3816,14 @@ static void scx_sub_init_cancel_task(struct scx_sched *sch, struct task_struct *
 static void scx_disable_and_exit_task(struct scx_sched *sch,
 				      struct task_struct *p)
 {
-	/*
-	 * %NONE means @p is already detached at the SCX level (e.g. handed
-	 * back to the parent by scx_fail_parent() with no init to undo).
-	 * Skip to avoid clobbering scx_task_sched() and writing %NONE again
-	 * on a state that's already %NONE.
-	 */
-	if (scx_get_task_state(p) == SCX_TASK_NONE)
-		return;
-
 	__scx_disable_and_exit_task(sch, p);
 
 	/*
 	 * If set, @p exited between __scx_init_task() and scx_enable_task() in
 	 * scx_sub_enable() and is initialized for both the associated sched and
 	 * its parent. Exit for the child too - scx_enable_task() never ran for
-	 * it, so undo only init_task.
+	 * it, so undo only init_task. The flag is only set on the sub-enable
+	 * path, so it's always clear when @p arrives here in %SCX_TASK_NONE.
 	 */
 	if (p->scx.flags & SCX_TASK_SUB_INIT) {
 		if (!WARN_ON_ONCE(!scx_enabling_sub_sched))
@@ -4975,6 +4967,8 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 	kfree(sch->cgrp_path);
 	if (sch_cgroup(sch))
 		cgroup_put(sch_cgroup(sch));
+	if (sch->sub_kset)
+		kobject_put(&sch->sub_kset->kobj);
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
 	for_each_possible_cpu(cpu) {
@@ -6035,7 +6029,7 @@ static void scx_sub_disable(struct scx_sched *sch)
 	if (sch->ops.exit)
 		SCX_CALL_OP(sch, exit, NULL, sch->exit_info);
 	if (sch->sub_kset)
-		kset_unregister(sch->sub_kset);
+		kobject_del(&sch->sub_kset->kobj);
 	kobject_del(&sch->kobj);
 }
 #else	/* CONFIG_EXT_SUB_SCHED */
@@ -6161,7 +6155,7 @@ static void scx_root_disable(struct scx_sched *sch)
 	 */
 #ifdef CONFIG_EXT_SUB_SCHED
 	if (sch->sub_kset)
-		kset_unregister(sch->sub_kset);
+		kobject_del(&sch->sub_kset->kobj);
 #endif
 	kobject_del(&sch->kobj);
 
@@ -6850,6 +6844,7 @@ static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 	rcu_assign_pointer(ops->priv, sch);
 
 	sch->kobj.kset = scx_kset;
+	INIT_LIST_HEAD(&sch->all);
 
 #ifdef CONFIG_EXT_SUB_SCHED
 	char *buf = kzalloc(PATH_MAX, GFP_KERNEL);
