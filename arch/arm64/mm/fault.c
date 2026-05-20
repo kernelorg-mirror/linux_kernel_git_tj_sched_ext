@@ -9,6 +9,7 @@
 
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
+#include <linux/bpf_defs.h>
 #include <linux/extable.h>
 #include <linux/kfence.h>
 #include <linux/signal.h>
@@ -416,9 +417,12 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 	} else if (addr < PAGE_SIZE) {
 		msg = "NULL pointer dereference";
 	} else {
-		if (esr_fsc_is_translation_fault(esr) &&
-		    kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
-			return;
+		if (esr_fsc_is_translation_fault(esr)) {
+			if (kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
+				return;
+			if (bpf_arena_handle_page_fault(addr, esr & ESR_ELx_WNR, regs->pc))
+				return;
+		}
 
 		msg = "paging request";
 	}
