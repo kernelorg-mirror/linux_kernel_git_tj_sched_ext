@@ -7469,11 +7469,13 @@ static struct bpf_struct_ops bpf_sched_ext_ops = {
 
 /*
  * cid-form cfi stubs. Stubs whose signatures match the cpu-form (param types
- * identical, only param names differ across structs) are reused. Only
- * set_cmask needs a fresh stub since the second argument type differs.
+ * identical, only param names differ across structs) are reused. Some need
+ * fresh stubs, set_cmask due to an argument type difference and the sub-sched
+ * notifiers because no cpu-form stub exists to reuse.
  */
 static void sched_ext_ops_cid__set_cmask(struct task_struct *p,
 					 const struct scx_cmask *cmask) {}
+static void sched_ext_ops__sub_caps_updated(const struct scx_cmask *cmask, u64 caps) {}
 
 static struct sched_ext_ops_cid __bpf_ops_sched_ext_ops_cid = {
 	.select_cid		= sched_ext_ops__select_cpu,
@@ -7506,6 +7508,7 @@ static struct sched_ext_ops_cid __bpf_ops_sched_ext_ops_cid = {
 #endif
 	.sub_attach		= sched_ext_ops__sub_attach,
 	.sub_detach		= sched_ext_ops__sub_detach,
+	.sub_caps_updated	= sched_ext_ops__sub_caps_updated,
 	.cid_online		= sched_ext_ops__cpu_online,
 	.cid_offline		= sched_ext_ops__cpu_offline,
 	.init_cids		= sched_ext_ops__init_cids,
@@ -9951,6 +9954,7 @@ static int __init scx_init(void)
 	CID_OFFSET_MATCH(dump_task, dump_task);
 	CID_OFFSET_MATCH(sub_attach, sub_attach);
 	CID_OFFSET_MATCH(sub_detach, sub_detach);
+	CID_OFFSET_MATCH(sub_caps_updated, sub_caps_updated);
 	CID_OFFSET_MATCH(init_cids, init_cids);
 	CID_OFFSET_MATCH(init, init);
 	CID_OFFSET_MATCH(exit, exit);
