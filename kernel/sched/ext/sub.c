@@ -82,6 +82,48 @@ void set_cgroup_sched(struct cgroup *cgrp, struct scx_sched *sch)
 		rcu_assign_pointer(pos->scx_sched, sch);
 }
 
+static void free_pshard(struct scx_pshard *pshard)
+{
+	kfree(pshard);
+}
+
+void scx_free_pshards(struct scx_sched *sch)
+{
+	s32 si;
+
+	if (!sch->pshard)
+		return;
+	for (si = 0; si < sch->nr_pshards; si++)
+		free_pshard(sch->pshard[si]);
+	kfree(sch->pshard);
+}
+
+static struct scx_pshard *alloc_pshard(struct scx_sched *sch, s32 shard_idx, s32 node)
+{
+	return kzalloc_node(sizeof(struct scx_pshard), GFP_KERNEL, node);
+}
+
+s32 scx_alloc_pshards(struct scx_sched *sch)
+{
+	s32 si;
+
+	if (!sch->is_cid_type || !sch->arena_pool)
+		return 0;
+
+	sch->pshard = kzalloc_objs(sch->pshard[0], scx_nr_cid_shards, GFP_KERNEL);
+	if (!sch->pshard)
+		return -ENOMEM;
+
+	sch->nr_pshards = scx_nr_cid_shards;
+
+	for (si = 0; si < scx_nr_cid_shards; si++) {
+		sch->pshard[si] = alloc_pshard(sch, si, scx_shard_node[si]);
+		if (!sch->pshard[si])
+			return -ENOMEM;
+	}
+	return 0;
+}
+
 static DECLARE_WAIT_QUEUE_HEAD(scx_unlink_waitq);
 
 void drain_descendants(struct scx_sched *sch)
