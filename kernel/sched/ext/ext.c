@@ -5696,6 +5696,14 @@ static void scx_root_disable(struct scx_sched *sch)
 	if (sch->ops.exit)
 		SCX_CALL_OP(sch, exit, NULL, sch->exit_info);
 
+	/*
+	 * @sch's programs (an armed timer, a tracing prog) can fire after
+	 * exit(). Now that exit()'s own kfuncs have resolved, stop
+	 * scx_prog_sched() from resolving to @sch and drain in-flight resolvers.
+	 */
+	WRITE_ONCE(sch->dead, true);
+	synchronize_rcu();
+
 	scx_unlink_sched(sch);
 
 	/*
