@@ -106,18 +106,26 @@ static inline u64 scx_missing_caps(struct scx_sched *sch, s32 cpu, u64 needed)
 /* map @enq_flags to the SCX_CAP_* bit required for the local-DSQ insert */
 static inline u64 scx_caps_for_enq(u64 enq_flags)
 {
-	return SCX_CAP_ENQ_IMMED;
+	if (enq_flags & SCX_ENQ_IMMED)
+		return SCX_CAP_ENQ_IMMED;
+	return SCX_CAP_ENQ;
 }
 
 /* map queued @p to the SCX_CAP_* bit required to stay on its local DSQ */
 static inline u64 scx_caps_for_task(struct task_struct *p)
 {
-	return SCX_CAP_ENQ_IMMED;
+	if (p->scx.flags & SCX_TASK_IMMED)
+		return SCX_CAP_ENQ_IMMED;
+	return SCX_CAP_ENQ;
 }
 
 /* caps implied by holding @cap */
 static inline u64 scx_caps_implied(u64 cap)
 {
+	switch (cap) {
+	case SCX_CAP_ENQ:
+		return SCX_CAP_ENQ_IMMED;
+	}
 	return 0;
 }
 
