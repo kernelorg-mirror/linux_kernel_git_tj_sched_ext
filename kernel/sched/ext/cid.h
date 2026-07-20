@@ -90,9 +90,10 @@ static inline bool cid_valid(struct scx_sched *sch, s32 cid)
  * __scx_cid_to_cpu - Unchecked cid->cpu table lookup
  * @cid: cid to look up. Must be in [0, num_possible_cpus()).
  *
- * Intended for callsites that have already validated @cid and that hold a
- * non-NULL @sch from scx_prog_sched() - a live sched implies the table has
- * been allocated, so no NULL check is needed here.
+ * Intended for callsites that have already validated @cid and where the
+ * tables are guaranteed allocated - ops invocations on a live scheduler or
+ * the enable path itself. Prog-facing kfuncs, which can run while the first
+ * enable is still allocating the tables, use the checked wrappers instead.
  */
 static inline s32 __scx_cid_to_cpu(s32 cid)
 {
@@ -119,13 +120,17 @@ static inline s32 __scx_cpu_to_cid(s32 cpu)
  * Return the cpu for @cid or a negative errno on failure. Invalid cid triggers
  * scx_error() on @sch. The cid arrays are allocated on first scheduler enable
  * and never freed, so the returned cpu is stable for the lifetime of the loaded
- * scheduler.
+ * scheduler. Return -EINVAL without triggering scx_error() if the tables are
+ * not allocated yet, which a prog-facing kfunc can observe while racing the
+ * first enable.
  */
 static inline s32 scx_cid_to_cpu(struct scx_sched *sch, s32 cid)
 {
-	if (!cid_valid(sch, cid))
+	s16 *tbl = READ_ONCE(scx_cid_to_cpu_tbl);
+
+	if (!cid_valid(sch, cid) || unlikely(!tbl))
 		return -EINVAL;
-	return __scx_cid_to_cpu(cid);
+	return tbl[cid];
 }
 
 /**
@@ -138,9 +143,11 @@ static inline s32 scx_cid_to_cpu(struct scx_sched *sch, s32 cid)
  */
 static inline s32 scx_cpu_to_cid(struct scx_sched *sch, s32 cpu)
 {
-	if (!scx_cpu_valid(sch, cpu, NULL))
+	s16 *tbl = READ_ONCE(scx_cpu_to_cid_tbl);
+
+	if (!scx_cpu_valid(sch, cpu, NULL) || unlikely(!tbl))
 		return -EINVAL;
-	return __scx_cpu_to_cid(cpu);
+	return tbl[cpu];
 }
 
 /**

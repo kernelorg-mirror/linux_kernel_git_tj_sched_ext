@@ -875,17 +875,18 @@ bool scx_cmask_empty(const struct scx_cmask *m)
 __bpf_kfunc void scx_bpf_cid_topo(s32 cid, struct scx_cid_topo *out__uninit,
 				  const struct bpf_prog_aux *aux)
 {
+	struct scx_cid_topo *topo = READ_ONCE(scx_cid_topo);
 	struct scx_sched *sch;
 
 	guard(rcu)();
 
 	sch = scx_prog_sched(aux);
-	if (unlikely(!sch) || !cid_valid(sch, cid)) {
+	if (unlikely(!sch) || !cid_valid(sch, cid) || unlikely(!topo)) {
 		*out__uninit = SCX_CID_TOPO_NEG;
 		return;
 	}
 
-	*out__uninit = READ_ONCE(scx_cid_topo)[cid];
+	*out__uninit = topo[cid];
 }
 
 __bpf_kfunc_end_defs();
