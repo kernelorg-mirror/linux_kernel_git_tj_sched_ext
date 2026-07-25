@@ -1546,7 +1546,6 @@ struct scx_sched {
 	 */
 	bool			warned_zero_slice:1;
 	bool			warned_unassoc_progs:1;
-	bool			warned_nmi_kick:1;
 
 	struct list_head	all;
 
