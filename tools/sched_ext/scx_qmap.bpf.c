@@ -230,9 +230,6 @@ static s32 pick_direct_dispatch_cid(struct task_struct *p, s32 prev_cid,
 	s32 cid;
 	u32 i;
 
-	if (!always_enq_immed && p->nr_cpus_allowed == 1)
-		return prev_cid;
-
 	if (cmask_test(prev_cid, &qa.self_cids.mask) &&
 	    cmask_test_and_clear(prev_cid, &qa.idle_cids.mask))
 		return prev_cid;
