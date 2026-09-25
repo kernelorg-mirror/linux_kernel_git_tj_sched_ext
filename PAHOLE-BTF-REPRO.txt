@@ -1,0 +1,117 @@
+Reproduction: pahole 1.32 drops scx_bpf_task_set_lazy_resched() from BTF
+========================================================================
+
+What is in this tree
+--------------------
+
+The sched_ext for-next branch at 3034afc27bd5 ("Merge branch 'for-7.4'
+into for-next"), 53 commits past sched_ext-for-7.3-rc4-fixes, plus this
+file. Nothing else is changed. The commit that matters is f8e5a4e3f3be
+("sched_ext: Add lazy preemption support"), which added the kfunc
+
+    __bpf_kfunc bool scx_bpf_task_set_lazy_resched(struct task_struct *p,
+                                                   bool lazy,
+                                                   struct bpf_prog_aux *aux)
+
+in kernel/sched/ext/ext.c. It is the only sched_ext kfunc whose argument
+clang moves out of its argument register in the prologue before
+describing it.
+
+Symptom
+-------
+
+Built with clang and pahole 1.32, vmlinux BTF has no FUNC for
+scx_bpf_task_set_lazy_resched(). scx_init() then fails to register the
+sched_ext kfunc sets, the boot log has
+
+    sched_ext: Failed to register kfunc sets (-22)
+
+/sys/kernel/sched_ext does not exist and no BPF scheduler can attach.
+pahole 1.31 on the same object keeps the function and everything works.
+
+Reproduce
+---------
+
+Tested with clang 22.1.8, pahole 1.32, bpftool 7.8 and virtme-ng 1.41 on
+x86-64. clang 19, 20 and 21 emit the same DWARF for the function.
+
+    # a config that boots under virtme-ng; any config with the five
+    # options below does for the BTF check
+    vng --kconfig
+    scripts/config -e BPF_SYSCALL -e BPF_JIT \
+        -e DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -e DEBUG_INFO_BTF \
+        -e SCHED_CLASS_EXT
+    make LLVM=1 olddefconfig
+    make LLVM=1 -j$(nproc)
+
+    # the function is in vmlinux but not in its BTF
+    nm vmlinux | grep ' scx_bpf_task_set_lazy_resched$'
+    bpftool btf dump file vmlinux format raw |
+        grep "FUNC 'scx_bpf_task_set_lazy_resched'"
+
+    # the same object through another pahole
+    pahole --btf_encode_detached=out.btf kernel/sched/build_policy.o
+    bpftool btf dump file out.btf format raw |
+        grep "FUNC 'scx_bpf_task_set_lazy_resched'"
+
+The grep prints nothing with pahole 1.32 and one line with 1.31 or 1.30.
+
+    # boot it and try a scheduler
+    make LLVM=1 -C tools/sched_ext
+    vng --run arch/x86/boot/bzImage
+    dmesg | grep sched_ext
+    ls /sys/kernel/sched_ext
+    tools/sched_ext/build/bin/scx_simple
+
+The boot log has the line above, the directory is missing and scx_simple
+fails with
+
+    libbpf: map 'simple_ops': failed to create: -ENOTSUPP
+    libbpf: failed to load BPF skeleton 'scx_simple': -ENOTSUPP
+    [SCX_BUG] scx_simple.c:91 (Unknown error 524)
+    Failed to load skel
+
+Cause
+-----
+
+x86-64 passes p in RDI, lazy in RSI and aux in RDX. The prologue clang
+emits and the location lists, from
+
+    llvm-dwarfdump --name=scx_bpf_task_set_lazy_resched --show-children \
+        -v vmlinux
+
+with offsets relative to the function's first instruction:
+
+    +0x00  endbr64                    p     [+0x09, +0x1d) RDI, then R14 ...
+    +0x04  nop (fentry)               aux   [+0x09, +0x1d) RDX, then R15 ...
+    +0x09  push %r15 .. push %rbx     lazy  [+0x18, +0x56) RBX, then
+    +0x10  mov  %rdx,%r15                   DW_OP_entry_value(RSI) ...
+    +0x13  mov  %esi,%ebx                   nothing for [+0x09, +0x18)
+    +0x15  mov  %rdi,%r14
+    +0x18  call __rcu_read_lock
+
+p and aux are described in their argument registers from the first
+instruction after the fentry pad on. lazy is first described after the
+prologue moved it into RBX, and the later entries reference
+DW_OP_entry_value(RSI), the value the register had at entry, not a
+location at entry.
+
+pahole 1.31 (dwarf_loader.c, parameter__reg()) accepted a parameter when
+any entry of its location list carried DW_OP_entry_value of the expected
+register. pahole 1.32 replaced that with the per-parameter decode of
+e96290426e18 ("dwarf_loader: Analyze per-parameter information for true
+signatures"): parameter__decode_location() keeps the first register the
+list yields, RBX, function__match_clang_parameter_locations() compares it
+with the expected RSI, marks the parameter unexpected_reg, and
+btf_encoder skips the function without a message.
+
+Workaround
+----------
+
+    OPTIMIZER_HIDE_VAR(lazy);
+
+as the first statement of the function makes clang materialize the
+argument at entry and emit a location entry for RSI there, and the
+function is back in BTF. The proper fix is pahole accepting an entry-value
+reference to the expected register as 1.31 did, or clang describing the
+parameter at entry.
