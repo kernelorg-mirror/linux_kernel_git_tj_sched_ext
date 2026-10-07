@@ -6,6 +6,7 @@
 #include "exceptions_ext.skel.h"
 #include "exceptions_fail.skel.h"
 #include "exceptions_assert.skel.h"
+#include "exceptions_dead_subprog.skel.h"
 
 static char log_buf[1024 * 1024];
 
@@ -55,6 +56,7 @@ static void test_exceptions_success(void)
 	RUN_SUCCESS(exception_ext, 0);
 	RUN_SUCCESS(exception_ext_mod_cb_runtime, 35);
 	RUN_SUCCESS(exception_throw_subprog, 1);
+	RUN_SUCCESS(exception_throw_subprog_stack_cb, 0x1234);
 	RUN_SUCCESS(exception_assert_nz_gfunc, 1);
 	RUN_SUCCESS(exception_assert_zero_gfunc, 1);
 	RUN_SUCCESS(exception_assert_neg_gfunc, 1);
@@ -409,9 +411,15 @@ static void test_exceptions_assertions(void)
 	RUN_TESTS(exceptions_assert);
 }
 
+static void test_exceptions_dead_subprog(void)
+{
+	RUN_TESTS(exceptions_dead_subprog);
+}
+
 void test_exceptions(void)
 {
 	test_exceptions_success();
 	test_exceptions_failure();
 	test_exceptions_assertions();
+	test_exceptions_dead_subprog();
 }
