@@ -2208,6 +2208,20 @@ void BPF_STRUCT_OPS(qmap_sub_ecaps_updated, s32 cid, u64 before, u64 after)
 	execute_partition();
 }
 
+void BPF_STRUCT_OPS(qmap_sub_child_ecaps_updated, u64 cgroup_id, s32 cid, u64 before,
+		    u64 after)
+{
+	__sync_fetch_and_add(&qa.nr_child_ecaps, 1);
+
+	/*
+	 * A cid's cpuperf target stays where the last write put it. Reset it
+	 * once a child's PERF revoke is in effect so that the child's last
+	 * target doesn't outlive the cap.
+	 */
+	if ((before & ~after) & SCX_CAP_PERF)
+		scx_bpf_cidperf_set(cid, SCX_CPUPERF_ONE);
+}
+
 SCX_OPS_CID_DEFINE(qmap_ops,
 	       .flags			= SCX_OPS_ENQ_EXITING | SCX_OPS_TID_TO_TASK,
 	       .select_cid		= (void *)qmap_select_cid,
@@ -2232,6 +2246,7 @@ SCX_OPS_CID_DEFINE(qmap_ops,
 	       .sub_caps_updated	= (void *)qmap_sub_caps_updated,
 	       .sub_ecaps_updated	= (void *)qmap_sub_ecaps_updated,
 	       .sub_cid_sched_updated	= (void *)qmap_sub_cid_sched_updated,
+	       .sub_child_ecaps_updated	= (void *)qmap_sub_child_ecaps_updated,
 	       .init_cids		= (void *)qmap_init_cids,
 	       .init			= (void *)qmap_init,
 	       .exit			= (void *)qmap_exit,
