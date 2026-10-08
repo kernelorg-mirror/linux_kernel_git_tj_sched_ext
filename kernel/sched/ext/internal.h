@@ -932,6 +932,29 @@ struct sched_ext_ops {
 	 */
 	void (*sub_cid_sched_updated)(s32 cid, u64 sched);
 
+	/**
+	 * @sub_child_ecaps_updated: A child's effective caps on a cid changed
+	 * @cgroup_id: cgroup id of the direct child
+	 * @cid: the cid whose effective caps changed
+	 * @before: the child's effective caps as of the last delivery
+	 * @after: the child's effective caps now
+	 *
+	 * A grant or revoke records the target caps and the cid applies them at
+	 * its next dispatch, which is when the child's kfuncs start seeing the
+	 * change. Invoked at that point, right after the child's
+	 * sub_ecaps_updated(). From here on the parent can act on a cap the
+	 * child lost: reset what the child set under it, such as the cpuperf
+	 * target, and schedule on the cid, since the child no longer can. The
+	 * caps a child holds when it is disabled are reported revoked before
+	 * sub_detach() runs. A cpu going offline drops caps without a report.
+	 *
+	 * Runs with the cid's rq lock held, and can perform all operations
+	 * allowed in ops.dispatch() including inserting/moving tasks. The
+	 * disable report runs outside the dispatch path, where a nested sub
+	 * dispatch triggers an scx_error().
+	 */
+	void (*sub_child_ecaps_updated)(u64 cgroup_id, s32 cid, u64 before, u64 after);
+
 	/*
 	 * All online ops must come before ops.cpu_online().
 	 */
@@ -1190,6 +1213,7 @@ struct sched_ext_ops_cid {
 	void (*sub_caps_updated)(const struct scx_cmask *cmask__arena, u64 caps);
 	void (*sub_ecaps_updated)(s32 cid, u64 before, u64 after);
 	void (*sub_cid_sched_updated)(s32 cid, u64 sched);
+	void (*sub_child_ecaps_updated)(u64 cgroup_id, s32 cid, u64 before, u64 after);
 	void (*cid_online)(s32 cid);
 	void (*cid_offline)(s32 cid);
 	s32 (*init_cids)(void);
@@ -1453,7 +1477,10 @@ struct scx_sched_pcpu {
 	struct llist_node	ecaps_to_sync_node;
 	/* owed a forced update_idle() re-notify on this cpu */
 	bool			idle_renotify;
-	/* effective caps as of the last sub_ecaps_updated() delivery */
+	/*
+	 * ecaps as of the last sub_ecaps_updated() and
+	 * sub_child_ecaps_updated() delivery. See __scx_process_sync_ecaps().
+	 */
 	u64			reported_ecaps;
 
 	/*
