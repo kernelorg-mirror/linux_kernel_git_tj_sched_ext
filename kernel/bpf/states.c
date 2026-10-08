@@ -4,8 +4,13 @@
 #include <linux/bpf_verifier.h>
 #include <linux/cnum.h>
 #include <linux/filter.h>
+#include <linux/moduleparam.h>
 
 #define verbose(env, fmt, args...) bpf_verifier_log_write(env, fmt, ##args)
+
+/* PROBE: explain pruning misses at this insn in the level-2 log */
+static int bpf_prune_dbg_insn = -1;
+core_param(bpf_prune_dbg_insn, bpf_prune_dbg_insn, int, 0644);
 
 #define BPF_COMPLEXITY_LIMIT_STATES	64
 
@@ -1013,6 +1018,58 @@ static bool states_equal(struct bpf_verifier_env *env,
 	return true;
 }
 
+/* PROBE: name every equivalence check that fails for (old, cur) */
+static void prune_dbg(struct bpf_verifier_env *env, struct bpf_verifier_state *old,
+		      struct bpf_verifier_state *cur, u32 insn_idx, enum exact_level exact,
+		      const char *why)
+{
+	int fr, i;
+
+	if (insn_idx != bpf_prune_dbg_insn || !(env->log.level & BPF_LOG_LEVEL2))
+		return;
+	verbose(env, "PRUNE_DBG miss at %u: %s branches=%u exact=%d\n", insn_idx, why,
+		old->branches, exact);
+	reset_idmap_scratch(env);
+	if (old->curframe != cur->curframe)
+		verbose(env, "PRUNE_DBG fail curframe\n");
+	if (old->speculative && !cur->speculative)
+		verbose(env, "PRUNE_DBG fail speculative\n");
+	if (old->in_sleepable != cur->in_sleepable)
+		verbose(env, "PRUNE_DBG fail in_sleepable\n");
+	if (!refsafe(old, cur, &env->idmap_scratch))
+		verbose(env, "PRUNE_DBG fail refsafe\n");
+	for (fr = 0; fr <= old->curframe && fr <= cur->curframe; fr++) {
+		struct bpf_func_state *o = old->frame[fr], *c = cur->frame[fr];
+		u32 idx = bpf_frame_insn_idx(old, fr);
+		u16 live_regs = env->insn_aux_data[idx].live_regs_before;
+
+		if (o->callsite != c->callsite)
+			verbose(env, "PRUNE_DBG fail frame%d callsite\n", fr);
+		if (o->callback_depth > c->callback_depth)
+			verbose(env, "PRUNE_DBG fail frame%d callback_depth\n", fr);
+		if (!o->no_stack_arg_load && c->no_stack_arg_load)
+			verbose(env, "PRUNE_DBG fail frame%d no_stack_arg_load\n", fr);
+		for (i = 0; i < MAX_BPF_REG; i++) {
+			reset_idmap_scratch(env);
+			if (((1 << i) & live_regs) &&
+			    !regsafe(env, &o->regs[i], &c->regs[i], &env->idmap_scratch, exact))
+				verbose(env, "PRUNE_DBG fail frame%d r%d old(type=%d precise=%d id=%d) cur(type=%d precise=%d id=%d)\n",
+					fr, i, o->regs[i].type, o->regs[i].precise, o->regs[i].id,
+					c->regs[i].type, c->regs[i].precise, c->regs[i].id);
+		}
+		reset_idmap_scratch(env);
+		if (!stacksafe(env, o, c, &env->idmap_scratch, exact))
+			verbose(env, "PRUNE_DBG fail frame%d stacksafe\n", fr);
+		reset_idmap_scratch(env);
+		if (!stack_arg_safe(env, o, c, &env->idmap_scratch, exact))
+			verbose(env, "PRUNE_DBG fail frame%d stack_arg_safe\n", fr);
+	}
+	verbose(env, "PRUNE_DBG old:");
+	print_verifier_state(env, old, old->curframe, true);
+	verbose(env, "PRUNE_DBG cur:");
+	print_verifier_state(env, cur, cur->curframe, true);
+}
+
 /* find precise scalars in the previous equivalent state and
  * propagate them into the current state
  */
@@ -1413,10 +1470,14 @@ skip_inf_loop_check:
 			    env->jmps_processed - env->prev_jmps_processed < 20 &&
 			    env->insn_processed - env->prev_insn_processed < 100)
 				add_new_state = false;
+			prune_dbg(env, &sl->state, cur, insn_idx, NOT_EXACT, "branches");
 			goto miss;
 		}
 		/* See comments for mark_all_regs_read_and_precise() */
 		loop = incomplete_read_marks(env, &sl->state);
+		if (!states_equal(env, &sl->state, cur, loop ? RANGE_WITHIN : NOT_EXACT))
+			prune_dbg(env, &sl->state, cur, insn_idx, loop ? RANGE_WITHIN : NOT_EXACT,
+				  loop ? "incomplete_marks" : "not_equal");
 		if (states_equal(env, &sl->state, cur, loop ? RANGE_WITHIN : NOT_EXACT)) {
 hit:
 			sl->hit_cnt++;
