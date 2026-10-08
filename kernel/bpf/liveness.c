@@ -2438,8 +2438,21 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		case BPF_CALL:
 			def = ALL_CALLER_SAVED_REGS;
 			use = def & ~BIT(BPF_REG_0);
-			if (bpf_get_call_summary(env, insn, &cs))
+			if (bpf_get_call_summary(env, insn, &cs)) {
 				use = GENMASK(min_t(u8, cs.arg_slot_cnt, MAX_BPF_FUNC_REG_ARGS), 1);
+			} else if (bpf_pseudo_call(insn)) {
+				/* a subprogram reads only its declared arguments */
+				int idx = insn - env->prog->insnsi;
+				int subprog = bpf_find_subprog(env, idx + insn->imm + 1);
+
+				if (subprog >= 0 && !btf_prepare_func_args(env, subprog) &&
+				    env->subprog_info[subprog].args_cached) {
+					u8 cnt = min_t(u8, env->subprog_info[subprog].arg_slot_cnt,
+						       MAX_BPF_FUNC_REG_ARGS);
+
+					use = cnt ? GENMASK(cnt, 1) : 0;
+				}
+			}
 			def = mask_widen(def);
 			use = mask_widen(use);
 			/* callx reads the address of the callee from dst_reg */
