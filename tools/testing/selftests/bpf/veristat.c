@@ -1725,6 +1725,9 @@ static int process_prog(const char *filename, struct bpf_object *obj, struct bpf
 		bpf_program__add_flags(prog, BPF_F_TEST_STATE_FREQ);
 	if (env.force_reg_invariants)
 		bpf_program__add_flags(prog, BPF_F_TEST_REG_INVARIANTS);
+	/* local probe: load objects built with SCX_ARENA_SCALAR */
+	if (getenv("VERISTAT_ARENA_SCALAR"))
+		bpf_program__add_flags(prog, BPF_F_ARENA_SCALAR);
 
 	opts.log_buf = buf;
 	opts.log_size = buf_sz;
@@ -2302,6 +2305,40 @@ static int process_obj(const char *filename)
 	}
 
 	fixup_obj_maps(obj);
+
+	/* local probe: replace the .rodata map's initial value with a dumped blob */
+	if (getenv("VERISTAT_RODATA")) {
+		struct bpf_map *map;
+
+		bpf_object__for_each_map(map, obj) {
+			const char *name = bpf_map__name(map);
+			size_t len = strlen(name), sz;
+			FILE *fp;
+			void *buf;
+
+			if (len < 7 || strcmp(name + len - 7, ".rodata"))
+				continue;
+			bpf_map__initial_value(map, &sz);
+			buf = calloc(1, sz);
+			fp = fopen(getenv("VERISTAT_RODATA"), "rb");
+			if (!fp || !buf) {
+				fprintf(stderr, "rodata: can't open blob or alloc %zu\n", sz);
+				goto cleanup;
+			}
+			if (fread(buf, 1, sz, fp) != sz || fgetc(fp) != EOF) {
+				fprintf(stderr, "rodata: blob size != %zu\n", sz);
+				fclose(fp);
+				err = -EINVAL;
+				goto cleanup;
+			}
+			fclose(fp);
+			err = bpf_map__set_initial_value(map, buf, sz);
+			fprintf(stderr, "rodata: set %zu bytes on '%s': %d\n", sz, name, err);
+			free(buf);
+			if (err)
+				goto cleanup;
+		}
+	}
 
 	err = set_global_vars(obj, env.presets, env.npresets);
 	if (err) {
