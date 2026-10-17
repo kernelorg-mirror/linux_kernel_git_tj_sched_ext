@@ -6746,6 +6746,9 @@ static void unbypass_renotify_idle(struct rq *rq, struct scx_sched *pos,
  *
  * - ops.dispatch() is ignored.
  *
+ * - ops.sub_ecaps_updated() and ops.sub_child_ecaps_updated() are still called.
+ *   The bypassed tasks are on the bypass DSQs, out of their reach.
+ *
  * - dispatch_one() does not report %SCX_DSP_PREV on non-zero slice as slice
  *   can't be trusted. Whenever a tick triggers, the running task is rotated to
  *   the tail of the queue.
@@ -6825,10 +6828,8 @@ void scx_bypass(struct scx_sched *sch, bool bypass)
 				pcpu->flags |= SCX_SCHED_PCPU_BYPASSING;
 			} else {
 				pcpu->flags &= ~SCX_SCHED_PCPU_BYPASSING;
-				if (was_bypassing) {
+				if (was_bypassing)
 					unbypass_renotify_idle(rq, pos, pcpu);
-					scx_unbypass_replay_ecaps(rq, pos);
-				}
 			}
 		}
 
