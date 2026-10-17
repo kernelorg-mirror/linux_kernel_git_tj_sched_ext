@@ -844,6 +844,7 @@ struct scx_rq {
 	/* sched of the open running session, see scx_cid_sched_update() */
 	struct scx_sched	*sched;
 	struct llist_head	ecaps_to_sync;		/* pending ecaps syncs */
+	u32			nr_ecaps_offline;	/* marked syncs a down waits for */
 	struct task_struct	*sub_dispatch_prev;
 #endif
 	cpumask_var_t		cpus_to_sync;
