@@ -4117,11 +4117,6 @@ static void handle_hotplug(struct rq *rq, bool online)
 	if (scx_enabled())
 		scx_idle_update_selcpu_topology(&sch->ops);
 
-	if (online)
-		scx_online_ecaps(rq);
-	else
-		scx_offline_ecaps(rq);
-
 	/*
 	 * The tables can't be retired while this function is running as the
 	 * retirement is inside cpus_read_lock. However, scx_cpu_arg() is
@@ -4150,6 +4145,14 @@ static void handle_hotplug(struct rq *rq, bool online)
 		}
 	}
 
+	/*
+	 * ecaps are delivered for @cpu only after ops.cpu_online() and before
+	 * ops.cpu_offline(). The ecaps ops may read online_cmask, so
+	 * scx_offline_ecaps() and scx_online_ecaps() run after its update.
+	 */
+	if (!online)
+		scx_offline_ecaps(rq);
+
 	if (online && SCX_HAS_OP(sch, cpu_online))
 		SCX_CALL_OP(sch, cpu_online, NULL, cpu_or_cid);
 	else if (!online && SCX_HAS_OP(sch, cpu_offline))
@@ -4159,6 +4162,9 @@ static void handle_hotplug(struct rq *rq, bool online)
 			 SCX_ECODE_ACT_RESTART | SCX_ECODE_RSN_HOTPLUG,
 			 "cpu %d going %s, exiting scheduler", cpu,
 			 online ? "online" : "offline");
+
+	if (online)
+		scx_online_ecaps(rq);
 }
 
 void scx_rq_activate(struct rq *rq)
@@ -8292,6 +8298,8 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 		cpus_read_unlock();
 		goto err_disable;
 	}
+
+	scx_init_rq_ops_online();
 
 	/*
 	 * Make the scheduler instance visible. Must be inside cpus_read_lock().

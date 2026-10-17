@@ -787,6 +787,13 @@ enum scx_rq_flags {
 	 */
 	SCX_RQ_ONLINE		= 1 << 0,
 	SCX_RQ_CAN_STOP_TICK	= 1 << 1,
+	/*
+	 * Set while the root considers the cpu online, from its
+	 * ops.cpu_online() until its ops.cpu_offline(). ecaps are delivered
+	 * only while it is set. %SCX_RQ_ONLINE follows the core's rq state
+	 * instead, which changes ahead of the root's view on both edges.
+	 */
+	SCX_RQ_OPS_ONLINE	= 1 << 2,
 	SCX_RQ_CLK_VALID	= 1 << 5, /* RQ clock is fresh and valid */
 	SCX_RQ_BAL_CB_PENDING	= 1 << 6, /* must queue a cb after dispatching */
 	SCX_RQ_SUB_IDLE_RENOTIFY	= 1 << 7, /* sub-scheds are owed update_idle() */
