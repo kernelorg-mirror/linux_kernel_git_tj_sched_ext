@@ -581,11 +581,11 @@ static void scx_rescue_timer_arm(struct rq *rq)
  * @p: task being admitted, off any DSQ
  * @slice: CPU time to grant
  *
- * The schedulers keep their normal control over @p and may preempt or reslice
- * it. @slice is measured on served CPU time against the snapshot taken here, so
- * neither shortens the rescue, see scx_rescue_charge() and scx_rescue_keep().
- * Prolonged denial escalates into protected execution, see
- * scx_rescue_timerfn().
+ * The slice is a kernel slice, see %SCX_TASK_KERNEL_SLICE. The schedulers keep
+ * their normal control over @p and may preempt or reslice it. @slice is
+ * measured on served CPU time against the snapshot taken here, so neither
+ * shortens the rescue, see scx_rescue_charge() and scx_rescue_keep(). Prolonged
+ * denial escalates into protected execution, see scx_rescue_timerfn().
  */
 static void scx_rescue_admit(struct rq *rq, struct task_struct *p, s64 slice)
 {
@@ -596,6 +596,7 @@ static void scx_rescue_admit(struct rq *rq, struct task_struct *p, s64 slice)
 	rq->scx.rescue.slice = slice;
 	rq->scx.rescue.exec_snap = p->se.sum_exec_runtime;
 	scx_set_task_slice(p, slice);
+	p->scx.flags |= SCX_TASK_KERNEL_SLICE;
 	scx_rescue_timer_arm(rq);
 }
 
