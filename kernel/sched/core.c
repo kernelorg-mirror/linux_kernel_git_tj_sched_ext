@@ -5925,6 +5925,7 @@ static void sched_tick_remote(struct work_struct *work)
 				WARN_ON_ONCE(delta > (u64)NSEC_PER_SEC * 30);
 			}
 			curr->sched_class->task_tick(rq, curr, 0);
+			scx_tick_remote(rq);
 
 			calc_load_nohz_remote(rq);
 		}

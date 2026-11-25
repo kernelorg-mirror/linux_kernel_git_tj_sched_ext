@@ -4511,6 +4511,18 @@ void scx_tick(struct rq *rq)
 	ext_server_tick(rq);
 }
 
+#ifdef CONFIG_NO_HZ_FULL
+/*
+ * Called once a second while @rq's tick is stopped. An RT task can keep the
+ * tick stopped with tasks runnable on SCX, see ext_server_tick().
+ */
+void scx_tick_remote(struct rq *rq)
+{
+	if (scx_enabled())
+		ext_server_tick(rq);
+}
+#endif
+
 static void task_tick_scx(struct rq *rq, struct task_struct *donor, int queued)
 {
 	struct scx_sched *sch = scx_task_sched(donor);

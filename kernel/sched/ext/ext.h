@@ -9,6 +9,7 @@
 #ifdef CONFIG_SCHED_CLASS_EXT
 
 void scx_tick(struct rq *rq);
+void scx_tick_remote(struct rq *rq);
 void init_scx_entity(struct sched_ext_entity *scx);
 void scx_pre_fork(struct task_struct *p);
 int scx_fork(struct task_struct *p, struct kernel_clone_args *kargs);
@@ -63,6 +64,7 @@ bool scx_prio_less(const struct task_struct *a, const struct task_struct *b,
 #else	/* CONFIG_SCHED_CLASS_EXT */
 
 static inline void scx_tick(struct rq *rq) {}
+static inline void scx_tick_remote(struct rq *rq) {}
 static inline void scx_pre_fork(struct task_struct *p) {}
 static inline int scx_fork(struct task_struct *p, struct kernel_clone_args *kargs) { return 0; }
 static inline void scx_post_fork(struct task_struct *p) {}
