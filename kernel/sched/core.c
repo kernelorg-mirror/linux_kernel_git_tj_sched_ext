@@ -8807,9 +8807,7 @@ int sched_cpu_dying(unsigned int cpu)
 		dump_rq_tasks(rq, KERN_WARNING);
 	}
 	dl_server_stop(&rq->fair_server);
-#ifdef CONFIG_SCHED_CLASS_EXT
-	dl_server_stop(&rq->ext_server);
-#endif
+	scx_rq_dying(rq);
 	rq_unlock_irqrestore(rq, &rf);
 
 	calc_load_migrate(rq);

@@ -18,6 +18,7 @@ enum scx_consts {
 	SCX_DSP_DFL_MAX_BATCH		= 32,
 	SCX_DSP_MAX_LOOPS		= 32,
 	SCX_WATCHDOG_MAX_TIMEOUT	= 30 * HZ,
+	SCX_EXT_SERVER_INTV		= HZ,	/* see ext_server_timerfn() */
 
 	/* rescue knob defaults and limits, see scx_rescue_timerfn() */
 	SCX_RESCUE_DFL_BW_PPT		= 20,		/* parts per thousand, 2% */

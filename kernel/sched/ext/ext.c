@@ -213,6 +213,21 @@ static unsigned long scx_watchdog_timestamp = INITIAL_JIFFIES;
 
 static struct delayed_work scx_watchdog_work;
 
+/* per-node state */
+struct scx_pnode {
+	s32			node;
+
+	/* see ext_server_timerfn() */
+	raw_spinlock_t		lock;			/* protects the following */
+	u32			nr_populated_rqs;	/* %SCX_RQ_POPULATED rqs on node */
+	struct timer_list	ext_server_timer;	/* armed while the above isn't 0 */
+} ____cacheline_aligned_in_smp;
+
+static struct scx_pnode **scx_pnode;
+
+/* nodes with %SCX_RQ_POPULATED rqs, see ext_server_timerfn() */
+static atomic_t scx_nr_populated_nodes;
+
 /*
  * For %SCX_KICK_WAIT: Each CPU has a pointer to an array of kick_sync sequence
  * numbers. The arrays are allocated with kvzalloc() as size can exceed percpu
@@ -2441,6 +2456,20 @@ static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int core_enq_
 	if (rq->scx.nr_running == 1)
 		dl_server_start(&rq->ext_server);
 
+	/* see ext_server_timerfn() */
+	if (!(rq->scx.flags & SCX_RQ_POPULATED)) {
+		struct scx_pnode *pnode = scx_pnode[cpu_to_node(cpu_of(rq))];
+
+		rq->scx.flags |= SCX_RQ_POPULATED;
+
+		guard(raw_spinlock)(&pnode->lock);
+		if (!pnode->nr_populated_rqs++) {
+			atomic_inc(&scx_nr_populated_nodes);
+			timer_reduce(&pnode->ext_server_timer,
+				     round_jiffies_up(jiffies + SCX_EXT_SERVER_INTV));
+		}
+	}
+
 	scx_do_enqueue_task(rq, p, enq_flags, sticky_cpu);
 out:
 	rq->scx.flags &= ~SCX_RQ_IN_WAKEUP;
@@ -2581,6 +2610,8 @@ static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int core_deq_
 
 	p->scx.flags &= ~SCX_TASK_QUEUED;
 	rq->scx.nr_running--;
+	if (!rq->scx.nr_running)
+		rq->scx.empty_at = jiffies;
 	sub_nr_running(rq, 1);
 
 	scx_dispatch_dequeue(rq, p);
@@ -4247,6 +4278,31 @@ void scx_rq_deactivate(struct rq *rq)
 	handle_hotplug(rq, false);
 }
 
+/* see ext_server_timerfn() */
+static void clear_rq_populated(struct rq *rq)
+{
+	struct scx_pnode *pnode = scx_pnode[cpu_to_node(cpu_of(rq))];
+
+	lockdep_assert_rq_held(rq);
+
+	rq->scx.flags &= ~SCX_RQ_POPULATED;
+
+	guard(raw_spinlock)(&pnode->lock);
+	if (!--pnode->nr_populated_rqs)
+		atomic_dec(&scx_nr_populated_nodes);
+}
+
+/* @rq's CPU is going down and has no tasks */
+void scx_rq_dying(struct rq *rq)
+{
+	lockdep_assert_rq_held(rq);
+
+	dl_server_stop(&rq->ext_server);
+
+	if (rq->scx.flags & SCX_RQ_POPULATED)
+		clear_rq_populated(rq);
+}
+
 static void rq_online_scx(struct rq *rq)
 {
 	rq->scx.flags |= SCX_RQ_ONLINE;
@@ -4339,6 +4395,96 @@ static void scx_watchdog_workfn(struct work_struct *work)
 		queue_delayed_work(system_dfl_wq, to_delayed_work(work), intv);
 }
 
+/* whether @rq's %SCX_RQ_POPULATED is due for clearing */
+static bool rq_populated_expired(struct rq *rq)
+{
+	return (rq->scx.flags & SCX_RQ_POPULATED) && !rq->scx.nr_running &&
+		time_after(jiffies, rq->scx.empty_at + SCX_EXT_SERVER_INTV);
+}
+
+/**
+ * ext_server_timerfn - Unmark a node's rqs which have no tasks
+ * @timer: ext_server_timer of the node's scx_pnode
+ *
+ * ext_server_tick() needs to know whether any task is runnable on SCX. An rq is
+ * marked %SCX_RQ_POPULATED and counted in its node's ->nr_populated_rqs when a
+ * task is enqueued on it. The mark is cleared here, after the rq has had no
+ * tasks for %SCX_EXT_SERVER_INTV, so that an rq which keeps running out of
+ * tasks doesn't write the count each time.
+ *
+ * scx_nr_populated_nodes is the number of nodes which have populated rqs. A
+ * node is counted when its first rq becomes populated and uncounted when its
+ * last one is unmarked. ext_server_tick() tests it without a lock and can see a
+ * newly populated node a tick late.
+ *
+ * scx_rq_dying() clears the mark of an offline CPU, which isn't in
+ * cpumask_of_node().
+ */
+static void ext_server_timerfn(struct timer_list *timer)
+{
+	struct scx_pnode *pnode = timer_container_of(pnode, timer, ext_server_timer);
+	s32 cpu;
+
+	for_each_cpu(cpu, cpumask_of_node(pnode->node)) {
+		struct rq *rq = cpu_rq(cpu);
+
+		/* most rqs fail the test, try before taking the rq lock */
+		if (!data_race(rq_populated_expired(rq)))
+			continue;
+
+		guard(rq_lock_irqsave)(rq);
+
+		if (rq_populated_expired(rq))
+			clear_rq_populated(rq);
+	}
+
+	guard(raw_spinlock_irqsave)(&pnode->lock);
+	if (pnode->nr_populated_rqs)
+		mod_timer(timer, round_jiffies_up(jiffies + SCX_EXT_SERVER_INTV));
+}
+
+/**
+ * ext_server_tick - Start ext_server if tasks may be waiting for the CPU
+ * @rq: rq of the CPU the tick is for
+ *
+ * ext_server starts when the first task is enqueued on @rq and stops when its
+ * pick finds no task. While a higher class task runs on the CPU, ext_server can
+ * be stopped with tasks waiting for the CPU in two cases. Start it for both.
+ *
+ * - A task reached the local DSQ after the pick, without being enqueued on @rq.
+ *   Start ext_server right away.
+ *
+ * - The BPF scheduler can run a task on any CPU the task is allowed on,
+ *   whichever rq it is queued on. Only ops.dispatch() can tell whether this CPU
+ *   has a task to run. If any rq is populated, start ext_server so that the CPU
+ *   dispatches, at most once a server period.
+ */
+static void ext_server_tick(struct rq *rq)
+{
+	struct sched_dl_entity *dl_se = &rq->ext_server;
+
+	if (dl_server_active(dl_se) ||
+	    !sched_class_above(rq->donor->sched_class, &ext_sched_class))
+		return;
+
+	if (rq->scx.local_dsq.nr) {
+		dl_server_start(dl_se);
+		return;
+	}
+
+	/*
+	 * With no task known to be waiting for this CPU, wait for the deadline
+	 * of the last period. A start before it can queue ext_server right
+	 * away, and the higher class task would then be preempted for an empty
+	 * pick on every tick.
+	 */
+	if (dl_time_before(rq_clock(rq), dl_se->deadline))
+		return;
+
+	if (atomic_read(&scx_nr_populated_nodes))
+		dl_server_start(dl_se);
+}
+
 void scx_tick(struct rq *rq)
 {
 	struct scx_sched *root;
@@ -4362,6 +4508,7 @@ void scx_tick(struct rq *rq)
 	}
 
 	update_other_load_avgs(rq);
+	ext_server_tick(rq);
 }
 
 static void task_tick_scx(struct rq *rq, struct task_struct *donor, int queued)
@@ -9547,7 +9694,7 @@ static struct notifier_block scx_pm_notifier = {
 
 void __init init_sched_ext_class(void)
 {
-	s32 cpu, v;
+	s32 cpu, node, v;
 
 	/*
 	 * The following is to prevent the compiler from optimizing out the enum
@@ -9589,6 +9736,19 @@ void __init init_sched_ext_class(void)
 	register_sysrq_key('S', &sysrq_sched_ext_reset_op);
 	register_sysrq_key('D', &sysrq_sched_ext_dump_op);
 	INIT_DELAYED_WORK(&scx_watchdog_work, scx_watchdog_workfn);
+
+	scx_pnode = kzalloc_objs(*scx_pnode, nr_node_ids);
+	BUG_ON(!scx_pnode);
+	for_each_node(node) {
+		struct scx_pnode *pnode;
+
+		pnode = kzalloc_node(sizeof(*pnode), GFP_KERNEL, node);
+		BUG_ON(!pnode);
+		pnode->node = node;
+		raw_spin_lock_init(&pnode->lock);
+		timer_setup(&pnode->ext_server_timer, ext_server_timerfn, 0);
+		scx_pnode[node] = pnode;
+	}
 
 #ifdef CONFIG_EXT_SUB_SCHED
 	BUG_ON(rhashtable_init(&scx_sched_hash, &scx_sched_hash_params));

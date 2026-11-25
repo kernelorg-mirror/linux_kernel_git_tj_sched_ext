@@ -804,6 +804,7 @@ enum scx_rq_flags {
 	SCX_RQ_PROXY_TICK	= 1 << 10, /* proxy execution requires the tick */
 	SCX_RQ_PROXY_PENDING	= 1 << 11, /* blocked donor awaits proxy resolution */
 	SCX_RQ_PROXY_BLOCKING	= 1 << 12, /* donor is being removed for sched change */
+	SCX_RQ_POPULATED	= 1 << 13, /* see ext_server_timerfn() */
 
 	SCX_RQ_IN_WAKEUP	= 1 << 16,
 	SCX_RQ_IN_DISPATCH	= 1 << 17,
@@ -838,6 +839,7 @@ struct scx_rq {
 	bool			cpu_released;
 	u32			flags;
 	u32			nr_immed;		/* ENQ_IMMED tasks on local_dsq */
+	unsigned long		empty_at;		/* when nr_running last became 0 */
 #ifdef CONFIG_SCHED_CORE
 	u32			lock_drop_seq;	/* nr dispatch lock releases */
 #endif
